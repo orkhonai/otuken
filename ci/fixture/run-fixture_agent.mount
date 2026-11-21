@@ -1,0 +1,11 @@
+# SPDX-License-Identifier: MIT
+[Unit]
+Description=Private executable storage for the Incus guest agent
+StopWhenUnneeded=yes
+
+[Mount]
+What=tmpfs
+Where=/run/fixture_agent
+Type=tmpfs
+Options=mode=0700,size=64M,nosuid,nodev,exec
+DirectoryMode=0700

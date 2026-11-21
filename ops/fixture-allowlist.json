@@ -1,0 +1,6 @@
+[
+  {"partition":"root","path":"/var/log","rule":"logs","reason":"guest services and packages write build-time logs"},
+  {"partition":"root","path":"/etc/fstab","rule":"fstab-uuid","reason":"filesystem UUID fields may differ between independent disk formats"},
+  {"role":"btrfs","partition":"root","path":"/boot/initrd.img-6.8.0-136-generic","rule":"initramfs","reason":"archive layout, embedded entropy and the generated mdadm timestamp vary; all other member contents and logical metadata are compared"},
+  {"role":"ext4","partition":"root","path":"/opt/ci-fixture/worker.disk.qcow2","rule":"content","reason":"QCOW2 container bytes may differ; the embedded worker is inventoried and compared separately"}
+]

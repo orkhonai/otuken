@@ -1,0 +1,15 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 640 160" width="640" height="160" role="img" aria-label="Ötüken">
+  <!-- SPDX-FileCopyrightText: Ötüken contributors -->
+  <!-- SPDX-License-Identifier: MIT -->
+  <rect width="640" height="160" rx="14" fill="#0f1419"/>
+  <rect x="6" y="6" width="628" height="148" rx="10" fill="none" stroke="#2c3846" stroke-width="1.5"/>
+  <!-- Minimalist geometric mountain-and-river emblem (Ötüken & Orkhon) -->
+  <g transform="translate(44, 34)">
+    <rect x="0" y="0" width="92" height="92" rx="12" fill="#161f29" stroke="#d4a359" stroke-width="2"/>
+    <path d="M16 66 L38 28 L52 50 L62 36 L76 66 Z" fill="none" stroke="#e8edf2" stroke-width="3.2" stroke-linejoin="round"/>
+    <path d="M22 76 Q38 69 48 75 T72 74" fill="none" stroke="#d4a359" stroke-width="3" stroke-linecap="round"/>
+    <circle cx="46" cy="18" r="3.5" fill="#d4a359"/>
+  </g>
+  <text x="166" y="92" fill="#f0f4f8" font-family="ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace" font-size="52" font-weight="700" letter-spacing="8">ÖTÜKEN</text>
+  <text x="168" y="124" fill="#9fb0c3" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, sans-serif" font-size="16" letter-spacing="2.5">AGENT-NATIVE LAYER FOR UBUNTU SERVERS</text>
+</svg>

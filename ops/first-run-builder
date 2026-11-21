@@ -1,0 +1,253 @@
+# SPDX-License-Identifier: MIT
+# Sourced by the reviewed, root-only first-run entry point.
+
+build_root=/var/lib/otuken-ci-build
+build_home=$build_root/home
+build_recipe=$build_root/recipe
+build_account=otuken-ci-build
+build_uid_file=$state/builder-uid
+origin_user_file=$state/origin-user
+
+builder_identity() {
+    local user uid gid home shell groups shadow sudo_rules sudo_status=0 denied origin_user origin_gid=""
+    IFS=: read -r user _ uid gid _ home shell < <(getent passwd "$build_account") ||
+        fail 'Dedicated build account is missing'
+    [[ $user == "$build_account" && $uid =~ ^[1-9][0-9]*$ && $home == "$build_home" &&
+        $shell == /usr/sbin/nologin ]] || fail 'Dedicated build account has unexpected settings'
+    [[ $(getent group "$build_account" | cut -d: -f3) == "$gid" &&
+        $(getent group "$build_account" | cut -d: -f4) == "" ]] || fail 'Unexpected builder private group'
+    groups=$(id -G "$build_account") || fail 'Cannot read builder groups'
+    if [[ -f $origin_user_file ]]; then
+        origin_user=$(<"$origin_user_file")
+        [[ $origin_user =~ ^[a-z_][a-z0-9_-]{0,31}$ && $origin_user != root && $origin_user != "$build_account" ]] ||
+            fail 'Invalid recorded build-input user'
+        origin_gid=$(id -g "$origin_user") || fail 'Cannot read build-input user primary group'
+    fi
+    [[ $groups == "$gid" && ( -z $origin_gid || $gid != "$origin_gid" ) ]] || fail 'Unexpected builder group membership'
+    shadow=$(getent shadow "$build_account" | cut -d: -f2)
+    [[ $shadow == '!'* || $shadow == '*'* ]] || fail 'Dedicated build account must be locked'
+    sudo_rules=$(LC_ALL=C sudo -n -l -U "$build_account" 2>&1) || sudo_status=$?
+    if [[ $sudo_rules == *"User $build_account may run the following commands on "* ]]; then
+        fail 'The fixture builder must have no sudo rule'
+    fi
+    # Listing another user's privileges can succeed even when the list is empty.
+    denied="User $build_account is not allowed to run sudo on "
+    [[ $sudo_status =~ ^[01]$ && $sudo_rules =~ ^"$denied"[^[:space:]]+$ ]] ||
+        fail 'Cannot verify that the fixture builder has no sudo rule'
+    if [[ -f $build_uid_file ]]; then
+        [[ $(<"$build_uid_file") == "$uid:$gid" ]] || fail 'Dedicated build UID or GID changed'
+    fi
+    printf '%s:%s\n' "$uid" "$gid"
+}
+
+builder_init() {
+    local origin=$1 supplied=$2 approved=$3 origin_user=$4 work commit stamp dir kind file filelist temp
+    local -a ubuntu_files=(SHA256SUMS SHA256SUMS.gpg ubuntu-24.04-server-cloudimg-amd64.img receipt.json)
+    [[ $origin_user =~ ^[a-z_][a-z0-9_-]{0,31}$ && $origin_user != root && $origin_user != "$build_account" ]] ||
+        fail 'Supply a dedicated unprivileged build-input user name'
+    [[ $origin =~ ^/[[:alnum:]_./-]+$ && $approved =~ ^[a-f0-9]{64}$ &&
+        -d $origin && ! -L $origin && $(stat -c '%U:%a:%i' -- "$origin") == "$origin_user:700:256" ]]
+    if [[ -f $origin_user_file ]]; then
+        [[ $(<"$origin_user_file") == "$origin_user" ]] || fail 'Build-input user differs from recorded state'
+    else
+        printf '%s\n' "$origin_user" > "$origin_user_file"
+    fi
+    commit=$(<"$state/reviewed-commit")
+    if [[ -f $state/builder-ready ]]; then
+        [[ $(<"$state/builder-ready") == "$approved" ]]
+        builder_identity >/dev/null
+        printf 'Dedicated fixture workspace: %s\nReviewed recipe: %s\n' "$build_home" "$build_recipe"
+        return
+    fi
+    [[ ! -f $state/builder-removed ]] || fail 'The dedicated builder has already been removed'
+    reserve_inputs 45
+    temp=$(mktemp -d "$state/.builder-XXXXXXXX")
+    (
+        trap 'rm -r -- "$temp"' EXIT
+        timeout 30 head -c 65537 -- "$supplied" > "$temp/reviewed-reference.json"
+        [[ $(sha256sum "$temp/reviewed-reference.json" | cut -d' ' -f1) == "$approved" ]]
+        if [[ ! -f $state/builder-intent ]]; then
+            [[ ! -e $build_root && ! -L $build_root ]]
+            if getent passwd "$build_account" || getent group "$build_account"; then
+                fail 'The requested dedicated account or group already exists'
+            fi
+            printf '%s\n' "$approved" > "$state/builder-intent"
+        fi
+        [[ $(<"$state/builder-intent") == "$approved" ]]
+        if ! getent passwd "$build_account" >/dev/null; then
+            useradd --system --no-create-home --no-log-init --user-group \
+                --home-dir "$build_home" --shell /usr/sbin/nologin "$build_account"
+        fi
+        stamp=$(builder_identity)
+        printf '%s\n' "$stamp" > "$build_uid_file"
+        if [[ ! -e $build_root ]]; then mkdir -m 0711 -- "$build_root"; fi
+        [[ ! -L $build_root && $(stat -c '%u:%a' "$build_root") == 0:711 ]]
+        if [[ ! -e $build_home ]]; then
+            btrfs subvolume create "$build_home"
+        fi
+        if [[ ! -L $build_home && $(stat -c '%u:%i' "$build_home") == 0:256 &&
+            -z $(find "$build_home" -mindepth 1 -maxdepth 1 -printf . -quit) ]]; then
+            chmod 0700 "$build_home"
+            chown "$stamp" "$build_home"
+        fi
+        [[ ! -L $build_home && $(stat -c '%u:%g:%a:%i' "$build_home") == "$stamp:700:256" ]]
+
+        work="$temp/inputs"
+        mkdir -p "$work"/{ubuntu,apt/tools,apt/archives}
+        copy_origin() {
+            local relative=$1 limit=$2 target=$3
+            timeout 900 runuser -u "$origin_user" -- /usr/bin/head -c "$((limit+1))" -- "$origin/$relative" > "$target"
+            [[ -s $target && $(stat -c %s "$target") -le $limit ]]
+        }
+        for file in "${ubuntu_files[@]}"; do
+            local limit=$((1024**2))
+            if [[ $file == *.img ]]; then limit=$((2*1024**3)); fi
+            copy_origin "ubuntu/$file" "$limit" "$work/ubuntu/$file"
+        done
+        local serial
+        serial=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["serial"])' "$work/ubuntu/receipt.json")
+        python3 -I "$source_dir/first_run_inputs.py" ubuntu "$work/ubuntu" "$serial" | cmp - "$work/ubuntu/receipt.json"
+        python3 -I -c 'import json,sys; assert json.load(open(sys.argv[1]))["ubuntu"] == json.load(open(sys.argv[2]))' \
+            "$temp/reviewed-reference.json" "$work/ubuntu/receipt.json"
+        for kind in tool guest; do
+            dir=tools
+            if [[ $kind == guest ]]; then dir=archives; fi
+            copy_origin "$kind-packages.sha256" 65536 "$work/$kind-packages.sha256"
+            filelist="$temp/$kind-files"
+            python3 -I "$source_dir/first_run_inputs.py" package-list "$work" "$temp/reviewed-reference.json" "$kind" > "$filelist"
+            while IFS= read -r file; do
+                copy_origin "apt/$dir/$file" "$((128*1024**2))" "$work/apt/$dir/$file"
+            done < "$filelist"
+            ( cd "$work/apt/$dir"; sha256sum -c --strict "$work/$kind-packages.sha256" )
+        done
+        mkdir -m 0755 "$temp/agent-manifests"
+        local role
+        for role in btrfs ext4 worker; do
+            copy_origin "manifests/$role.json.gz" "$((32*1024**2))" "$temp/agent-manifests/$role.json.gz"
+            chmod 0644 "$temp/agent-manifests/$role.json.gz"
+        done
+        python3 -I "$source_dir/first_run_inputs.py" verify-agent "$temp/agent-manifests" "$temp/reviewed-reference.json"
+        if [[ ! -e $build_recipe ]]; then
+            mkdir -m 0755 "$temp/recipe"
+            (umask 022; git_local -c tar.umask=022 archive "$commit" ci ops | tar --no-same-owner -xf - -C "$temp/recipe")
+            install -m 0644 "$temp/reviewed-reference.json" "$temp/recipe/reviewed-reference.json"
+            mv -T -- "$temp/agent-manifests" "$temp/recipe/agent-manifests"
+            printf '%s\n' "$commit" > "$temp/.reviewed-commit"
+            install -m 0644 "$temp/.reviewed-commit" "$temp/recipe/.reviewed-commit"
+            cp -aT -- "$temp/recipe" "$build_recipe"
+        fi
+        [[ ! -L $build_recipe && $(stat -c '%u:%a' "$build_recipe") == 0:755 ]]
+        [[ $(<"$build_recipe/.reviewed-commit") == "$commit" ]]
+        cmp -s "$temp/reviewed-reference.json" "$build_recipe/reviewed-reference.json"
+        python3 -I "$source_dir/first_run_inputs.py" verify-agent "$build_recipe/agent-manifests" "$build_recipe/reviewed-reference.json"
+        # The private account is locked and has not run any build command yet.
+        [[ -z $(find "$build_home" -mindepth 1 -maxdepth 1 -printf . -quit) ]] ||
+            fail 'Incomplete input handoff; roll back before rebuilding'
+        cp -a -- "$work"/. "$build_home/"
+        chown -R "$stamp" "$build_home"
+        printf '%s\n' "$approved" > "$state/builder-ready"
+    )
+    printf 'Dedicated fixture workspace: %s\nReviewed recipe: %s\n' "$build_home" "$build_recipe"
+}
+
+builder_run() {
+    local action=$1 work=$build_home builder uid stamp phase
+    [[ -f $state/builder-ready && ! -f $state/builder-removed ]]
+    stamp=$(builder_identity)
+    builder=$(stat -c %U -- "$work")
+    [[ $builder == "$build_account" && $(stat -c '%u:%g:%a:%i' "$work") == "$stamp:700:256" ]]
+    uid=${stamp%:*}
+    local -a clean=(/usr/bin/env -i PATH=/usr/bin:/bin HOME="$work" USER="$builder" LOGNAME="$builder"
+        /usr/bin/nice -n 15 /usr/bin/ionice -c 3)
+    cd /
+    if [[ $action == build ]]; then
+        sudo -n -u "$builder" -- "${clean[@]}" "$build_recipe/ci/fixture-apt" "$work" offline
+        for phase in base ext4 btrfs manifests; do
+            sudo -n -u "$builder" -- "${clean[@]}" "$build_recipe/ci/fixture-build" "$work" "$phase"
+        done
+    else
+        [[ $action == attest && -f $work/logs/ext4.boot.ok && -f $work/logs/btrfs.boot.ok ]]
+    fi
+    # Compare guest files before granting KVM access.
+    sudo -n -u "$builder" -- "${clean[@]}" /usr/bin/python3 -I "$build_recipe/ops/first_run_inputs.py" \
+        match "$work" "$build_recipe/reviewed-reference.json" "$build_recipe/agent-manifests"
+    if [[ $action == build ]]; then
+        printf 'Dedicated guest inventories match the independently reviewed reference\n'
+        return
+    fi
+    local manifest group_paths kvm_confirm
+    [[ -c /dev/kvm ]] || fail '/dev/kvm is unavailable on this host'
+    find /dev -group kvm -ls
+    group_paths=$(find /dev -group kvm -printf '%y %p\n' | sort)
+    grep -Fxq 'c /dev/kvm' <<< "$group_paths" || fail '/dev/kvm is not accessible to the kvm group'
+    if [[ -f $state/kvm-devices-approved ]]; then
+        [[ $group_paths == "$(<"$state/kvm-devices-approved")" ]] ||
+            fail 'KVM group device census changed since approval; review the listed access before proceeding'
+    else
+        read -rp 'Type grant-kvm-access to approve the listed KVM-group devices for this attestation: ' kvm_confirm </dev/tty
+        [[ $kvm_confirm == grant-kvm-access ]] || fail 'KVM device access confirmation withheld'
+        printf '%s\n' "$group_paths" > "$state/kvm-devices-approved"
+    fi
+    if [[ ! -f $state/builder-attestation ]]; then
+        if pgrep -u "$uid" >/dev/null; then fail 'Dedicated builder still has running processes'; fi
+        sudo -n -u "$builder" -g kvm -- "${clean[@]}" "$build_recipe/ci/fixture-build" "$work" attest
+        manifest=$(sudo -n -u "$builder" -- "${clean[@]}" sha256sum -- "$work/media/PROVENANCE.json")
+        printf '%s %s\n' "$uid" "${manifest%% *}" > "$state/builder-attestation"
+    fi
+    printf 'Dedicated attestation (UID and hash): %s\n' "$(<"$state/builder-attestation")"
+}
+
+builder_cleanup() {
+    [[ -f $state/builder-intent && ! -f $state/builder-removed ]] || return 0
+    local stamp uid gid
+    if getent passwd "$build_account" >/dev/null; then
+        stamp=$(builder_identity)
+        uid=${stamp%:*}
+        if pgrep -u "$uid" >/dev/null; then fail 'Dedicated builder still has running processes'; fi
+    elif [[ -f $build_uid_file ]]; then
+        stamp=$(<"$build_uid_file")
+    elif [[ -e $build_root || -L $build_root ]]; then
+        fail 'No recorded owner for the dedicated builder directory'
+    fi
+    if [[ -e $build_root || -L $build_root ]]; then
+        [[ ! -L $build_root && $(stat -c '%u:%a' "$build_root") == 0:711 ]]
+        if [[ -e $build_home || -L $build_home ]]; then
+            [[ ! -L $build_home ]]
+            if [[ $(stat -c '%u:%i' "$build_home") == 0:256 &&
+                -z $(find "$build_home" -mindepth 1 -maxdepth 1 -printf . -quit) ]]; then
+                printf 'Removing the empty workspace from interrupted setup\n'
+            else
+                [[ $(stat -c '%u:%g:%a:%i' "$build_home") == "$stamp:700:256" ]]
+                if [[ ! -e $state/builder-evidence ]]; then btrfs subvolume snapshot -r "$build_home" "$state/builder-evidence"; fi
+            fi
+            btrfs subvolume delete --commit-after "$build_home"
+        fi
+        if [[ -e $build_recipe || -L $build_recipe ]]; then
+            [[ ! -L $build_recipe && $(stat -c '%u:%a' "$build_recipe") == 0:755 ]]
+            rm -r -- "$build_recipe"
+        fi
+        rmdir -- "$build_root"
+    fi
+    if getent passwd "$build_account" >/dev/null; then userdel "$build_account"; fi
+    if getent group "$build_account" >/dev/null; then
+        gid=${stamp#*:}
+        [[ $(getent group "$build_account" | cut -d: -f3,4) == "$gid:" ]]
+        groupdel "$build_account"
+    fi
+    touch "$state/builder-removed"
+    printf 'Dedicated builder removed; its private evidence remains under the first-run state\n'
+}
+
+builder_retire() {
+    local pin
+    [[ -f $state/fixture-approval && -f $fixtures/IMAGES.sha256.sig ]] ||
+        fail 'Admit the reviewed fixture media before retiring the builder'
+    derived "$build_home/media" "$(<"$state/fixture-approval")"
+    if [[ ! -f $state/fixture-reference.json ]]; then
+        pin=$(mktemp "$state/.fixture-reference.XXXXXXXX")
+        install -m 0600 -- "$build_recipe/reviewed-reference.json" "$pin"
+        mv -T -- "$pin" "$state/fixture-reference.json"
+    fi
+    builder_cleanup
+    printf 'Dedicated builder retired; admitted images and private evidence retained\n'
+}

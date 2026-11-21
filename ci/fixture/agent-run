@@ -1,0 +1,17 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+set -Eeuo pipefail
+mountpoint=$(mktemp -d /run/fixture-agent-config.XXXXXXXX)
+trap 'if mountpoint -q "$mountpoint"; then umount "$mountpoint"; fi; rmdir "$mountpoint"' EXIT
+modprobe 9pnet_virtio || true
+if [[ -b /dev/disk/by-label/incus-agent ]]; then
+    mount -o ro /dev/disk/by-label/incus-agent "$mountpoint"
+elif ! mount -t 9p -o ro,trans=virtio,access=0 config "$mountpoint"; then
+    printf 'Incus agent config is unavailable on the CD-ROM or 9p transport\n' >&2
+    exit 1
+fi
+cp -R -- "$mountpoint/." .
+umount "$mountpoint"
+rmdir "$mountpoint"
+trap - EXIT
+exec ./incus-agent

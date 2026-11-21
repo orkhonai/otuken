@@ -1,0 +1,133 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Executed only by cloud-init inside a disposable fixture VM.
+set -Eeuo pipefail
+export DEBIAN_FRONTEND=noninteractive LC_ALL=C
+exec > /dev/ttyS0 2>&1
+trap 'echo "FIXTURE ERROR line $LINENO"; systemctl poweroff --no-block || true' ERR
+phase=$1
+media=/mnt/fixture-input
+install -d "$media"
+mount -o ro,nosuid,nodev /dev/disk/by-label/FIXTUREPKGS "$media"
+[[ $(findmnt -n -o FSTYPE -T /) == ext4 ]]
+[[ $(ls -1 /sys/class/net) == lo ]]
+
+scrub() {
+    local root=$1
+    chroot "$root" cloud-init clean --logs --machine-id --seed
+    rm -f "$root"/etc/ssh/ssh_host_* "$root/var/lib/snapd/state.json"{,.bak,.old} \
+        "$root/var/lib/systemd/random-seed" "$root/var/cache/ldconfig/aux-cache" \
+        "$root/var/lib/landscape/landscape-sysinfo.cache" "$root/var/lib/PackageKit/transactions.db"{,-shm,-wal}
+    rm -rf -- "$root/var/log/journal"
+    find "$root/var/cache/man" "$root/var/cache/swcatalog" -type f \( -name index.db -o -name '*.xb' \) -delete
+    chroot "$root" apt-get clean
+}
+
+finish() {
+    exec >/dev/ttyS0 2>&1
+    trap 'echo "FIXTURE SCRUB FAILED line $LINENO"; systemctl poweroff --no-block || true' ERR
+    # Release persistent logs and stop writers before deleting their state.
+    # The snapd masks live in /run and disappear on the first fixture boot.
+    systemctl mask --runtime --now snapd.socket snapd.service
+    systemctl stop systemd-random-seed.service
+    journalctl --relinquish-var
+    scrub /
+    sync
+    fstrim --verbose /
+    local part
+    for part in /boot /boot/efi; do
+        if mountpoint -q "$part"; then fstrim --verbose "$part"; fi
+    done
+    sync
+    echo "FIXTURE COMPLETE $1"
+    systemctl poweroff
+}
+
+case "$phase" in
+    base)
+        # Package postinst may generate host keys. Keep its writes in /run,
+        # then persist the SSH configuration without any generated keys.
+        ssh_stage=$(mktemp -d /run/fixture-ssh.XXXXXXXX)
+        cp -a /etc/ssh/. "$ssh_stage/"
+        rm -f "$ssh_stage"/ssh_host_*
+        chmod 0755 "$ssh_stage"
+        mount --bind "$ssh_stage" /etc/ssh
+        printf '%s\n' 'deb [trusted=yes] file:/mnt/fixture-input/debs ./' > /run/fixture.list
+        apt=(apt-get -o Dir::Etc::sourcelist=/run/fixture.list -o Dir::Etc::sourceparts=/dev/null \
+            -o APT::Get::List-Cleanup=0 -o Dpkg::Options::=--force-confold)
+        printf '#!/bin/sh\nexit 101\n' > /usr/sbin/policy-rc.d
+        chmod 0755 /usr/sbin/policy-rc.d
+        "${apt[@]}" update
+        "${apt[@]}" -y --no-install-recommends install \
+            btrfs-progs dosfstools gdisk grub-efi-amd64-bin rsync openssh-server nftables dnsmasq-base \
+            incus incus-base incus-client
+        rm /usr/sbin/policy-rc.d
+        rm -f "$ssh_stage"/ssh_host_*
+        umount /etc/ssh
+        rsync -aHAX --delete "$ssh_stage/" /etc/ssh/
+        rm -r -- "$ssh_stage"
+        # The nested daemon is started explicitly only by the isolation lane.
+        systemctl disable incus.service incus.socket incus-user.socket incus-startup.service incus-lxcfs.service
+        install -d /opt/ci-fixture
+        install -m 0755 "$media/agent-run" "$media/isolation-setup" "$media/mount-canary" /opt/ci-fixture
+        install -m 0644 "$media/topology.py" /opt/ci-fixture/
+        install -m 0644 "$media/incus-agent.service" "$media/run-fixture_agent.mount" /etc/systemd/system/
+        install -D -m 0644 "$media/incus-agent.rules" /etc/udev/rules.d/99-fixture-incus-agent.rules
+        systemctl mask systemd-networkd-wait-online.service
+        printf 'datasource_list: [ NoCloud, None ]\nnetwork: {config: disabled}\n' > /etc/cloud/cloud.cfg.d/99-fixture.cfg
+        dpkg-query -W incus incus-base incus-client btrfs-progs
+        ;;
+    ext4)
+        install -m 0644 "$media/worker.disk.qcow2" "$media/worker.metadata.tar.xz" /opt/ci-fixture/
+        ;;
+    btrfs)
+        target=/mnt/fixture-btrfs
+        [[ -b /dev/vdb && $(lsblk -ndo TYPE /dev/vdb) == disk && -z $(lsblk -nro FSTYPE /dev/vdb) ]]
+        sgdisk -n 1:0:+256M -t 1:ef00 -n 2:0:0 -t 2:8300 \
+            -U 2f18af67-c414-5fd8-9caf-09ac24dc68fd \
+            -u 1:baf6137c-da9d-5f71-a832-b9477aabf9df -u 2:c2d1640d-ef2a-5b51-86de-6b302ac81bea /dev/vdb
+        udevadm settle
+        mkfs.vfat --invariant -F32 /dev/vdb1
+        mkfs.btrfs -U ffd769ba-1024-53b1-81ce-40a6cf09bee9 -L fixture-root /dev/vdb2
+        install -d "$target"
+        mount /dev/vdb2 "$target"
+        # Copy the mount points, leaving the live guest's runtime files behind.
+        rsync -aHAXx --exclude=/boot/efi/ --exclude=/etc/ssh/ssh_host_\* \
+            --exclude=/var/cache/apt/archives/ --exclude=/mnt/fixture-input/ \
+            --exclude='/run/*' --exclude='/tmp/*' --exclude='/var/tmp/*' / "$target/"
+        install -d "$target/boot/efi" "$target/var/cache/apt/archives/partial" "$target/mnt/fixture-input"
+        rsync -aHAXx --exclude=/efi/ /boot/ "$target/boot/"
+        mount /dev/vdb1 "$target/boot/efi"
+        root_uuid=$(blkid -s UUID -o value /dev/vdb2)
+        efi_uuid=$(blkid -s UUID -o value /dev/vdb1)
+        printf 'UUID=%s / btrfs defaults 0 0\nUUID=%s /boot/efi vfat umask=0077 0 1\n' \
+            "$root_uuid" "$efi_uuid" > "$target/etc/fstab"
+        for part in dev proc sys; do
+            mount --rbind "/$part" "$target/$part"
+            mount --make-rslave "$target/$part"
+        done
+        grep -qxF btrfs "$target/etc/initramfs-tools/modules" || echo btrfs >> "$target/etc/initramfs-tools/modules"
+        # Force the installed EFI path. Keep firmware variables disposable.
+        chroot "$target" grub-install --target=x86_64-efi --efi-directory=/boot/efi \
+            --removable --no-nvram --no-uefi-secure-boot
+        chroot "$target" update-initramfs -u -k all
+        chroot "$target" grub-mkconfig -o /boot/grub/grub.cfg
+        scrub "$target"
+        # Tools run in the chroot can create fresh scratch data, such as the blkid cache.
+        find "$target/run" "$target/tmp" "$target/var/tmp" -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
+        sync
+        fstrim --verbose "$target"
+        fstrim --verbose "$target/boot/efi"
+        for part in sys proc dev boot/efi; do umount -R "$target/$part"; done
+        umount "$target"
+        ;;
+    *) exit 2 ;;
+esac
+umount "$media"
+# Wait for cloud-final to finish before cleaning its state.
+{
+    declare -f scrub finish
+    # shellcheck disable=SC2016
+    printf 'finish "$1"\n'
+} > /run/fixture-finish
+systemd-run --no-block --property=After=cloud-final.service /bin/bash -Eeuc 'source /run/fixture-finish' bash "$phase"

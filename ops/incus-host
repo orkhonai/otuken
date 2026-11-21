@@ -1,0 +1,418 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+set -Eeuo pipefail
+umask 077
+export LC_ALL=C PATH=/usr/sbin:/usr/bin:/sbin:/bin
+
+[[ $EUID == 0 && $# == 1 ]] || { printf 'Usage as owner: incus-host prepare|install|review|rollback\n' >&2; exit 2; }
+phase=$1
+pointer=/root/otuken-incus.evidence
+source_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+version=1:7.0.2-ubuntu24.04-202611021332
+pin=4EFC590696CB15B87C73A3AD82CC8797C838DCFD
+incus_packages=(incus incus-base incus-client)
+apt_packages=("incus=$version" "incus-base=$version" "incus-client=$version")
+units=(incus.service incus.socket incus-lxcfs.service incus-startup.service incus-user.service incus-user.socket)
+source_file=/etc/apt/sources.list.d/otuken-incus.sources
+pin_file=/etc/apt/preferences.d/otuken-incus
+apt_key=/etc/apt/keyrings/otuken-zabbly.asc
+vendor_sysctl=/usr/lib/sysctl.d/50-incus.conf
+diverted=$vendor_sysctl.incus-disabled
+dropin=/etc/systemd/system/incus.service.d/90-otuken-ci.conf
+data=/var/lib/incus
+project=otuken-ci
+sysctls=(
+    net.ipv4.ip_forward net.ipv6.conf.all.forwarding
+    fs.aio-max-nr fs.inotify.max_queued_events fs.inotify.max_user_instances fs.inotify.max_user_watches
+    kernel.keys.maxbytes kernel.keys.maxkeys net.ipv4.fib_sync_mem
+    net.ipv4.neigh.default.gc_thresh3 net.ipv6.neigh.default.gc_thresh3 vm.max_map_count
+    kernel.apparmor_restrict_unprivileged_unconfined
+)
+watch_units=(
+    systemd-sysctl.service ssh.service systemd-networkd.service
+    systemd-resolved.service apparmor.service
+)
+if [[ -n ${OTUKEN_CI_WATCH_UNITS:-} ]]; then
+    read -r -a extra_watch_units <<< "$OTUKEN_CI_WATCH_UNITS"
+    for unit in "${extra_watch_units[@]}"; do
+        [[ $unit =~ ^[A-Za-z0-9@._-]+\.service$ ]] || { printf 'Invalid unit in OTUKEN_CI_WATCH_UNITS: %s\n' "$unit" >&2; exit 2; }
+        watch_units+=("$unit")
+    done
+fi
+if [[ $source_dir == /opt/otuken-ci/runner/ops ]]; then
+    runner=${source_dir%/ops}
+    for path in / /opt /opt/otuken-ci "$runner" "$source_dir"; do
+        [[ -d $path && ! -L $path && $(stat -c '%u:%a' "$path") =~ ^0:(700|755)$ ]] || exit 1
+    done
+    [[ ! -L "$source_dir/trust.py" && $(stat -c '%u:%a' "$source_dir/trust.py") == 0:644 ]]
+    python3 -I "$source_dir/trust.py" runner "$runner"
+else
+    [[ $phase != prepare && $source_dir =~ ^/root/otuken-incus\.[A-Za-z0-9]{8}$ ]]
+    for path in / /root "$source_dir"; do
+        [[ -d $path && ! -L $path && $(stat -c '%u:%a' "$path") =~ ^0:(700|755)$ ]] || exit 1
+    done
+    [[ ! -L "$source_dir/trust.py" && $(stat -c '%u:%a' "$source_dir/trust.py") == 0:600 ]]
+    python3 -I "$source_dir/trust.py" maintenance "$source_dir"
+fi
+exec 9>/run/otuken-incus-maintenance.lock
+flock -n 9
+fail() { printf '%s\n' "$*" >&2; exit 1; }
+absent() { [[ ! -e $1 && ! -L $1 ]]; }
+inc() { timeout -k 10 120 incus --force-local "$@"; }
+project_empty() {
+    local instances images
+    instances=$(inc --project "$1" list -c n --format csv) &&
+        images=$(inc --project "$1" image list -c f --format csv) &&
+        [[ -z $instances && -z $images ]]
+}
+state() { python3 -I "$evidence/host_state.py" "$1" "$evidence" "${@:2}"; }
+confirm() {
+    local expected=$1 entered
+    read -rp "Type $expected to continue: " entered </dev/tty
+    [[ $entered == "$expected" ]] || fail "Confirmation withheld"
+}
+
+capture() {
+    local label=$1
+    state capture "$label"
+    nft -s list ruleset > "$evidence/$label.nft"
+    ip -br link > "$evidence/$label.links"
+    ip -4 route > "$evidence/$label.routes"
+    ip -6 route >> "$evidence/$label.routes"
+    resolvectl status > "$evidence/$label.resolved"
+    readlink /etc/resolv.conf > "$evidence/$label.resolv-link"
+    ss -lntup > "$evidence/$label.listeners"
+    ss -l --vsock > "$evidence/$label.vsock"
+    lsmod > "$evidence/$label.lsmod"
+    sysctl "${sysctls[@]}" > "$evidence/$label.sysctl"
+    systemctl list-units --type=service --state=running --no-legend > "$evidence/$label.services"
+    systemctl show "${watch_units[@]}" \
+        -p Id -p ActiveState -p ActiveEnterTimestampMonotonic > "$evidence/$label.start-times"
+}
+
+diff_evidence() {
+    local label=$1 item result
+    for item in sysctl resolv-link nft links routes resolved listeners vsock services start-times lsmod json; do
+        result=0
+        diff -u "$evidence/before.$item" "$evidence/$label.$item" |
+            tee "$evidence/$label.$item.diff" || result=$?
+        (( result <= 1 )) || fail "Could not capture diff: $item"
+    done
+    printf 'Inspect the diffs in %s. Dynamic rules, process counts and timestamps may vary.\n' "$evidence"
+}
+
+check_platform() {
+    [[ $(dpkg --print-architecture) == amd64 && -c /dev/kvm ]]
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    [[ "$ID:$VERSION_ID:$VERSION_CODENAME" == ubuntu:24.04:noble ]]
+    [[ $(findmnt -n -o FSTYPE -T /var/lib) == btrfs ]]
+    [[ -e /sys/fs/cgroup/cgroup.controllers ]]
+}
+
+prepare() {
+    check_platform
+    if ! absent "$pointer"; then
+        [[ -f "$pointer" && ! -L "$pointer" && $(stat -c '%u:%a' "$pointer") == 0:600 ]] ||
+            fail "Unsafe evidence pointer"
+        IFS= read -r evidence < "$pointer"
+        [[ $evidence =~ ^/root/otuken-incus\.[A-Za-z0-9]{8}$ &&
+            -d $evidence && ! -L $evidence && $(stat -c '%u:%a' "$evidence") == 0:700 ]] ||
+            fail "Unsafe evidence directory"
+        [[ -f "$evidence/prepare-ok" && ! -f "$evidence/rollback-ok" ]] ||
+            fail "Prior preparation is incomplete or retired; use the saved rollback"
+        printf 'Preparation already complete in %s\n' "$evidence"
+        return
+    fi
+    for path in "$data" /var/lib/incus-lxcfs /var/cache/incus /var/log/incus \
+        /etc/sysctl.d/50-incus.conf /run/systemd/system/systemd-sysctl.service \
+        "$vendor_sysctl" "$diverted" "$source_file" "$pin_file" "$apt_key" "$dropin" \
+        /etc/systemd/system/incus.service.d; do
+        absent "$path" || fail "Existing path: $path"
+    done
+    for name in incus incus-admin; do
+        [[ -z $(getent group "$name") ]]
+    done
+    [[ -z $(getent passwd incus) ]]
+    for unit in "${units[@]}"; do
+        [[ $(systemctl show -p LoadState --value "$unit") == not-found ]]
+        absent "/etc/systemd/system/$unit"
+    done
+    [[ $(dpkg-divert --truename "$vendor_sysctl") == "$vendor_sysctl" ]]
+    evidence=$(mktemp -d /root/otuken-incus.XXXXXXXX)
+    install -m 0700 "$source_dir/incus-host" "$evidence/incus-host"
+    install -m 0600 "$source_dir/host_state.py" "$evidence/host_state.py"
+    install -m 0600 "$source_dir/trust.py" "$evidence/trust.py"
+    capture before
+    printf '%s\n' "$evidence" > "$evidence/pointer-new"
+    mv -T -- "$evidence/pointer-new" "$pointer"
+    printf 'Private maintenance evidence: %s\n' "$evidence"
+
+    install -d -m 0700 "$evidence/gpg"
+    curl --proto '=https' --tlsv1.2 -fsS https://pkgs.zabbly.com/key.asc -o "$evidence/zabbly.asc"
+    fingerprints=$(gpg --batch --no-options --homedir "$evidence/gpg" --with-colons \
+        --show-keys "$evidence/zabbly.asc" |
+        awk -F: '$1=="pub" {primary=1; next} primary && $1=="fpr" {print $10; primary=0}')
+    [[ $fingerprints == "$pin" ]]
+    cat > "$evidence/incus.sources" <<'DEB822'
+Types: deb
+URIs: https://pkgs.zabbly.com/incus/lts-7.0
+Suites: noble
+Components: main
+Architectures: amd64
+Signed-By: /etc/apt/keyrings/otuken-zabbly.asc
+DEB822
+    cat > "$evidence/incus.preferences" <<'PREFERENCES'
+Package: incus incus-base incus-client
+Pin: origin pkgs.zabbly.com
+Pin-Priority: 990
+
+Package: *
+Pin: origin pkgs.zabbly.com
+Pin-Priority: -1
+PREFERENCES
+    if absent /etc/apt/keyrings; then
+        touch "$evidence/created-keyrings"
+        install -d -m 0755 /etc/apt/keyrings
+    fi
+    install -m 0644 "$evidence/zabbly.asc" "$apt_key"
+    install -m 0644 "$evidence/incus.preferences" "$pin_file"
+    install -m 0644 "$evidence/incus.sources" "$source_file"
+    apt-get update
+    for pkg in "${incus_packages[@]}"; do
+        apt-cache madison "$pkg" | awk -F'|' -v version="$version" '
+            {gsub(/^[ \t]+|[ \t]+$/, "", $2)}
+            $2 == version && $3 ~ /pkgs[.]zabbly[.]com\/incus\/lts-7[.]0/ {found=1}
+            END {exit !found}'
+    done
+    apt-get -s --no-install-recommends --no-upgrade --no-remove install "${apt_packages[@]}" |
+        tee "$evidence/apt-plan"
+    state check-install "$evidence/apt-plan"
+    touch "$evidence/prepare-ok"
+    printf 'Review the plan. Use the saved incus-host script with install in a fresh shell.\n'
+}
+
+write_limits() {
+    local root_device kernel_name block disk device numbers
+    root_device=$(findmnt -n -o SOURCE -T /var/lib)
+    root_device=${root_device%%\[*}
+    [[ -b "$root_device" ]] || fail "The btrfs root needs an explicit block-device cap"
+    kernel_name=$(lsblk -dn -o KNAME "$root_device")
+    declare -A devices=(["$root_device"]=1)
+    for block in /sys/class/block/"$kernel_name"/slaves/*; do
+        [[ -e "$block" ]] || continue
+        disk=$(readlink -f -- "$block")
+        if [[ -e "$disk/partition" ]]; then disk=$(dirname -- "$disk"); fi
+        device="/dev/${disk##*/}"
+        [[ -b "$device" ]]
+        devices["$device"]=1
+    done
+    install -d -m 0755 "$(dirname -- "$dropin")"
+    {
+        printf '[Service]\nCPUQuota=400%%\n'
+        for device in "${!devices[@]}"; do
+            printf 'IOReadBandwidthMax=%s 40000000\nIOWriteBandwidthMax=%s 25000000\n' "$device" "$device"
+        done
+    } > "$evidence/limits.conf"
+    : > "$evidence/limit-devices"
+    for device in "${!devices[@]}"; do
+        numbers=$(lsblk -dn -o MAJ:MIN "$device")
+        printf '%s\n' "$numbers" >> "$evidence/limit-devices"
+    done
+    install -m 0644 "$evidence/limits.conf" "$dropin"
+}
+
+verify_limits() {
+    local group device
+    group=$(systemctl show incus.service -p ControlGroup --value)
+    [[ $group == /system.slice/incus.service ]]
+    local quota period
+    read -r quota period < "/sys/fs/cgroup$group/cpu.max"
+    [[ $quota =~ ^[0-9]+$ && $period =~ ^[0-9]+$ && $quota -eq $((4 * period)) ]]
+    while read -r device; do
+        awk -v dev="$device" '$1==dev && /rbps=40000000/ && /wbps=25000000/ {found=1}
+            END {exit !found}' "/sys/fs/cgroup$group/io.max"
+    done < "$evidence/limit-devices"
+    cat "/sys/fs/cgroup$group/io.max" "/sys/fs/cgroup$group/io.stat" > "$evidence/io.provisioned"
+}
+
+install_incus() {
+    check_platform
+    if [[ -f "$evidence/provisioned-ok" && ! -f "$evidence/rollback-ok" ]]; then
+        printf 'Incus already provisioned in %s\n' "$evidence"
+        return
+    fi
+    [[ -f "$evidence/prepare-ok" && -s "$evidence/apt-plan" && ! -f "$evidence/rollback-ok" ]] ||
+        fail "Prepare and review the apt plan first"
+    absent "$evidence/install-started" || fail "Use rollback to clear a prior or interrupted install"
+    apt-get -s --no-install-recommends --no-upgrade --no-remove install "${apt_packages[@]}" > "$evidence/apt-plan.current"
+    state check-install "$evidence/apt-plan.current"
+    cmp "$evidence/apt-plan" "$evidence/apt-plan.current"
+    diff -u "$evidence/before.start-times" <(systemctl show "${watch_units[@]}" \
+        -p Id -p ActiveState -p ActiveEnterTimestampMonotonic)
+    cat "$evidence/apt-plan"
+    confirm install-incus
+    touch "$evidence/install-started"
+    trap 'result=$?; if (( result )); then capture provisioned || true; fi' EXIT
+
+    btrfs subvolume create "$data"
+    chmod 0700 "$data"
+    dpkg-divert --local --add --rename --divert "$diverted" "$vendor_sysctl"
+    systemctl mask "${units[@]}"
+    (
+        systemctl mask --runtime systemd-sysctl.service
+        trap 'systemctl unmask --runtime systemd-sysctl.service' EXIT
+        [[ $(systemctl is-enabled systemd-sysctl.service || true) == masked-runtime ]]
+        result=0
+        NEEDRESTART_MODE=l apt-get --no-install-recommends --no-upgrade --no-remove install "${apt_packages[@]}" || result=$?
+        state capture installed
+        exit "$result"
+    )
+    apt-mark hold "${incus_packages[@]}"
+    absent "$vendor_sysctl"
+    capture installed
+    cmp "$evidence/before.sysctl" "$evidence/installed.sysctl"
+
+    write_limits
+    systemctl unmask incus.service incus.socket incus-lxcfs.service
+    systemctl enable --now incus.socket
+    inc admin init --preseed <<'YAML'
+config:
+  images.auto_update_interval: "0"
+networks: []
+storage_pools: []
+profiles: []
+projects: []
+YAML
+    [[ -z $(inc config get core.https_address) ]]
+    inc network list --format json |
+        python3 -I -c 'import json,sys; assert not any(n["managed"] for n in json.load(sys.stdin))'
+    verify_limits
+    inc storage create "$project" dir volume.size=32GiB
+    inc project create "$project" -c restricted=true -c features.images=true -c features.profiles=true \
+        -c features.networks=true -c limits.networks=0 -c limits.instances=1 -c limits.containers=0 \
+        -c limits.virtual-machines=1 -c limits.cpu=4 -c limits.memory=8GiB -c limits.disk=80GiB \
+        -c restricted.devices.disk=managed -c restricted.devices.nic=block \
+        -c "restricted.storage-pools.access=$project" -c restricted.virtual-machines.lowlevel=block
+    inc --project "$project" profile create "$project"
+    inc --project "$project" profile set "$project" limits.cpu=4 limits.memory=8GiB boot.autostart=false
+    inc --project "$project" profile device add "$project" root disk path=/ "pool=$project" size=32GiB limits.max=25MiB,400iops
+    install -d -m 0700 "$data/otuken-ci-evidence"
+    capture provisioned
+    diff_evidence provisioned
+    cmp "$evidence/before.sysctl" "$evidence/provisioned.sysctl"
+    cmp "$evidence/before.resolv-link" "$evidence/provisioned.resolv-link"
+    touch "$evidence/provisioned-ok"
+}
+
+remove_owned() {
+    local source=$1 target=$2
+    if ! absent "$target"; then
+        [[ -f "$target" && ! -L "$target" ]]
+        cmp "$source" "$target"
+        unlink "$target"
+    fi
+}
+
+rollback() {
+    exec 8>/run/otuken-ci.lock
+    flock -n 8 || fail "A CI run still holds its lock"
+    if [[ -f "$evidence/rollback-ok" ]]; then
+        python3 -I "$evidence/trust.py" cleanup
+        printf 'Rollback already verified in %s\n' "$evidence"
+        return
+    fi
+    confirm restore-incus-baseline
+    if [[ -f "$evidence/install-started" ]]; then
+        [[ -f "$evidence/installed.json" ]] || state capture installed
+        [[ -f "$evidence/provisioned.json" ]] || state capture provisioned
+        if systemctl is-active --quiet incus.socket; then
+            # Retain run evidence before purge. A populated CI project is an operator decision.
+            inc project list --format json | python3 -I -c                 'import json,sys; assert {p["name"] for p in json.load(sys.stdin)} <= {"default","otuken-ci"}'
+            inc storage list --format json | python3 -I -c                 'import json,sys; assert {p["name"] for p in json.load(sys.stdin)} <= {"otuken-ci"}'
+            project_empty default
+            if inc project show "$project" > "$evidence/rollback.project" 2>/dev/null; then
+                project_empty "$project"
+                if inc --project "$project" profile show "$project" >/dev/null 2>&1; then
+                    inc --project "$project" profile delete "$project"
+                fi
+                inc project delete "$project"
+            fi
+            if inc storage show "$project" > "$evidence/rollback.pool" 2>/dev/null; then
+                inc storage delete "$project"
+            fi
+            systemctl disable --now incus.socket
+        fi
+        if systemctl is-active --quiet incus.service || systemctl is-active --quiet incus-lxcfs.service; then
+            systemctl stop incus.service incus-lxcfs.service
+        fi
+        if [[ -e "$data/otuken-ci-evidence" && ! -e "$evidence/ci-evidence" ]]; then
+            cp -a -- "$data/otuken-ci-evidence" "$evidence/ci-evidence"
+        fi
+        remove_owned "$evidence/limits.conf" "$dropin"
+        if [[ -d ${dropin%/*} ]]; then rmdir -- "${dropin%/*}"; fi
+        systemctl unmask "${units[@]}"
+        if [[ $(systemctl is-enabled systemd-sysctl.service || true) == masked-runtime ]]; then
+            systemctl unmask --runtime systemd-sysctl.service
+        fi
+
+        state additions > "$evidence/purge-packages"
+        mapfile -t purge < "$evidence/purge-packages"
+        if (( ${#purge[@]} )); then
+            apt-mark showhold | awk '$0=="incus" || $0=="incus-base" || $0=="incus-client"' > "$evidence/holds"
+            mapfile -t holds < "$evidence/holds"
+            if (( ${#holds[@]} )); then apt-mark unhold "${holds[@]}"; fi
+            apt-get -s --no-auto-remove purge "${purge[@]}" | tee "$evidence/purge-plan"
+            state check-purge "$evidence/purge-plan"
+            printf '\nThese packages will be purged. Check scripts and services for direct tool use:\n'
+            printf '  %s\n' "${purge[@]}"
+            confirm purge-recorded-packages
+            NEEDRESTART_MODE=l apt-get --no-auto-remove purge "${purge[@]}"
+        fi
+        if [[ $(dpkg-divert --truename "$vendor_sysctl") == "$diverted" ]]; then
+            dpkg-divert --local --remove --rename --divert "$diverted" "$vendor_sysctl"
+        fi
+        if [[ -d "$data" ]]; then
+            [[ $(stat -c '%i' "$data") == 256 ]]
+            btrfs subvolume delete --commit-after "$data"
+        fi
+        state restore-ids
+        state restore-modules
+        for path in "$data" /var/lib/incus-lxcfs /var/cache/incus /var/log/incus "$diverted"; do
+            absent "$path" || fail "Incus-owned path remains after rollback: $path"
+        done
+        for unit in "${units[@]}"; do
+            [[ $(systemctl show -p LoadState --value "$unit") == not-found ]]
+        done
+    fi
+    remove_owned "$evidence/incus.sources" "$source_file"
+    remove_owned "$evidence/incus.preferences" "$pin_file"
+    remove_owned "$evidence/zabbly.asc" "$apt_key"
+    if [[ -e "$evidence/created-keyrings" && -d /etc/apt/keyrings ]]; then
+        rmdir /etc/apt/keyrings
+    fi
+    apt-get update
+    capture reverted
+    diff_evidence reverted
+    state compare
+    touch "$evidence/rollback-ok"
+    python3 -I "$evidence/trust.py" cleanup
+    printf 'Recorded Incus package, identity and module changes are reversed. Review other differences in the evidence.\n'
+}
+
+if [[ $phase == prepare ]]; then
+    prepare
+else
+    [[ -f "$pointer" && ! -L "$pointer" && $(stat -c '%u:%a' "$pointer") == 0:600 ]] || fail "No safe evidence pointer"
+    IFS= read -r evidence < "$pointer"
+    [[ $evidence =~ ^/root/otuken-incus\.[A-Za-z0-9]{8}$ &&
+        -d $evidence && ! -L $evidence && $(stat -c '%u:%a' "$evidence") == 0:700 ]] || fail "Unsafe evidence directory"
+    [[ $source_dir == /opt/otuken-ci/runner/ops || $source_dir == "$evidence" ]] ||
+        fail "Saved runner does not match the active evidence pointer"
+    case "$phase" in
+        install) install_incus ;;
+        review) capture review; diff_evidence review ;;
+        rollback) rollback ;;
+        *) fail "Unknown stage: $phase" ;;
+    esac
+fi

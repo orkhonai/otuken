@@ -1,0 +1,142 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+set -Eeuo pipefail
+umask 077
+base=/var/tmp/otuken-ci
+cd -- "$base"
+if (( EUID != 0 )); then
+    printf 'Use inside a disposable guest only\n' >&2
+    exit 1
+fi
+installed=/opt/otuken/current/otuken
+args=()
+
+bundle() {
+    args=(--bundle "$base/$1" --version "$2" --allowed-signers "$base/allowed_signers")
+}
+
+bootstrap() {
+    local label=$1 version=$2
+    local artifact="otuken-$version.tar.gz"
+    (
+        cd -- "$base/$label"
+        ssh-keygen -Y verify -f "$base/allowed_signers" -I otuken-release \
+            -n otuken-release -s SHA256SUMS.sig < SHA256SUMS
+        awk -v name="$artifact" '$2 == name { n++; print } END { if (n != 1) exit 1 }' SHA256SUMS |
+            sha256sum --check --strict
+        tar -xzf "$artifact" --no-same-owner
+    ) >&2
+    printf '%s\n' "$base/$label/otuken-$version/otuken"
+}
+
+plan() {
+    local output result=0
+    output=$("$@" --json) || result=$?
+    [[ $result == 2 || $result == 0 ]] || return "$result"
+    printf '%s\n' "$output"
+}
+
+apply() {
+    local result checksum
+    result=$(plan "$@")
+    checksum=$(python3 -c 'import json, sys; print(json.load(sys.stdin)["digest"])' <<< "$result")
+    "$@" --plan-digest "$checksum"
+}
+
+check_release() {
+    "$installed" self-check
+    "$installed" status |
+        python3 -c 'import json, sys; s=json.load(sys.stdin); assert s["current"] == sys.argv[1] and not s["recovery_pending"]' "$1"
+}
+
+case "$1" in
+    cloud-install)
+        version=$(basename candidate/otuken-*.tar.gz .tar.gz)
+        version=${version#otuken-}
+        loader=$(bootstrap candidate "$version")
+        bundle candidate "$version"
+        "$loader" install "${args[@]}" --overlay "$base/cloud-overlay" --yes
+        ;;
+    manual|cloud)
+        version=$2
+        bundle candidate "$version"
+        if [[ $1 == manual ]]; then
+            loader=$(bootstrap candidate "$version")
+            apply "$loader" install "${args[@]}"
+        fi
+        check_release "$version"
+        marker=/var/lib/otuken/state/ci-idempotence
+        printf 'retained\n' > "$marker"
+        before=$(stat -c '%i:%Y' "$installed")
+        units=$(systemctl list-unit-files 'otuken*' --no-legend)
+        empty=$(plan "$installed" plan "${args[@]}")
+        python3 -c 'import json,sys; assert not json.load(sys.stdin)["plan"]["changes"]' <<< "$empty"
+        apply "$installed" install "${args[@]}"
+        [[ $before == "$(stat -c '%i:%Y' "$installed")" ]]
+        [[ $(cat "$marker") == retained ]]
+        [[ $units == "$(systemctl list-unit-files 'otuken*' --no-legend)" ]]
+        ;;
+    check)
+        check_release "$2"
+        [[ $(cat /var/lib/otuken/state/ci-idempotence) == retained ]]
+        ;;
+    upgrade)
+        previous=$2 candidate=$3
+        loader=$(bootstrap previous "$previous")
+        bundle previous "$previous"
+        apply "$loader" install "${args[@]}"
+        systemctl show -p ActiveState ssh.socket ssh.service > "$base/ssh.before"
+        printf 'fixture-policy\n' > /etc/otuken/ci-policy
+        printf 'fixture-project\n' > /var/lib/otuken/projects/project-a
+        printf 'fixture-vault\n' > /var/lib/otuken/vault/page
+        candidate_loader=$(bootstrap candidate "$candidate")
+        if [[ ! -f /var/lib/otuken/control/release-signers ]]; then
+            public=$(awk '$1=="otuken-release" {print $2, $3}' "$base/allowed_signers")
+            fingerprint=$(ssh-keygen -lf /dev/stdin <<< "$public" | awk '{print $2}')
+            "$candidate_loader" rotate-key --allowed-signers "$base/allowed_signers" --fingerprint "$fingerprint"
+        fi
+        bundle candidate "$candidate"
+        apply "$candidate_loader" update --channel rc "${args[@]}"
+        ;;
+    rollback)
+        check_release "$3"
+        printf 'rollback-me\n' > /etc/otuken/ci-policy
+        printf 'preserve-me\n' > /var/lib/otuken/vault/page
+        apply "$installed" rollback
+        check_release "$2"
+        [[ $(cat /etc/otuken/ci-policy) == fixture-policy ]]
+        [[ $(cat /var/lib/otuken/projects/project-a) == fixture-project ]]
+        [[ $(cat /var/lib/otuken/vault/page) == preserve-me ]]
+        # Use the verified unpacked previous loader to retry after /opt is removed.
+        loader=$(bootstrap previous "$2")
+        apply "$installed" uninstall
+        [[ ! -e $installed && -d /etc/otuken && -d /var/lib/otuken ]]
+        "$loader" uninstall
+        test_dir=$(mktemp -d /var/tmp/otuken-installer-ci.XXXXXXXX)
+        candidate_tree=$(bootstrap candidate "$3")
+        cp -a "$(dirname "$candidate_tree")" "$test_dir/suite"
+        chown -R nobody:nogroup "$test_dir"
+        runuser -u nobody -- env PYTHONPATH="$test_dir/suite/engine" PYTHONDONTWRITEBYTECODE=1 \
+            python3 -m unittest discover -s "$test_dir/suite/test" -p test_installer.py -v
+        systemctl show -p ActiveState ssh.socket ssh.service > "$base/ssh.after"
+        diff -u "$base/ssh.before" "$base/ssh.after"
+        ;;
+    isolation)
+        test_dir=$(mktemp -d /var/tmp/otuken-guard-ci.XXXXXXXX)
+        version=$(<candidate/version)
+        candidate_tree=$(bootstrap candidate "$version")
+        cp -a "$(dirname "$candidate_tree")" "$test_dir/suite"
+        chown -R nobody:nogroup "$test_dir"
+        runuser -u nobody -- env PYTHONPATH="$test_dir/suite/engine" PYTHONDONTWRITEBYTECODE=1 \
+            python3 -m unittest discover -s "$test_dir/suite/test" -p test_guard.py -v
+        # Files and network are exercised against an owner-signed, offline topology.
+        # A bare installer test VM cannot substantiate a full isolation pass.
+        [[ -c /dev/kvm && -x /opt/ci-fixture/isolation-setup ]] || {
+            printf 'T4–T6 require the nested fixture or the separate offline isolation lane\n' >&2
+            exit 1
+        }
+        /opt/ci-fixture/isolation-setup
+        python3 -I suite/ci/isolation.py /run/ci-fixture/topology.json
+        ;;
+    *) exit 2 ;;
+esac

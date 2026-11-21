@@ -1,0 +1,116 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Fetch into a private APT state; extract host tools without package installation.
+set -Eeuo pipefail
+umask 077
+export LC_ALL=C
+(( EUID != 0 && $# == 2 ))
+work=$1 action=$2
+[[ $work =~ ^/[[:alnum:]_./-]+$ && -d $work && ! -L $work && $(stat -c '%u:%a' "$work") == "$EUID:700" ]]
+repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+apt="$work/apt"
+mkdir -p "$apt"/{lists/partial,archives/partial,gpg,tools}
+touch "$apt/empty.status"
+exec 9>"$apt/lock"
+flock -n 9
+guest_index() {
+    (
+        cd "$apt/archives"
+        for archive in *.deb; do
+            dpkg-deb -f "$archive"
+            printf 'Filename: ./%s\nSize: %s\nSHA256: %s\n\n' "$archive" \
+                "$(stat -c %s "$archive")" "$(sha256sum "$archive" | cut -d' ' -f1)"
+        done > "$work/Packages.tmp"
+    )
+    mv -T -- "$work/Packages.tmp" "$work/Packages"
+}
+extract_tools() {
+    # Re-extract from the verified debs, including on resume.
+    mkdir -p "$work/tool-root"
+    for archive in "$apt/tools"/*.deb; do dpkg-deb -x "$archive" "$work/tool-root"; done
+}
+if [[ $action == offline ]]; then
+    for kind in tool guest; do
+        dir=tools
+        if [[ $kind == guest ]]; then dir=archives; fi
+        python3 -I "$repo/ops/first_run_inputs.py" package-list "$work" "$repo/reviewed-reference.json" "$kind" > "$apt/$kind-files"
+        ( cd "$apt/$dir"; sha256sum -c --strict "$work/$kind-packages.sha256" )
+        ( cd "$apt/$dir"; printf '%s\n' *.deb ) | cmp - "$apt/$kind-files"
+    done
+    extract_tools
+    guest_index
+    printf 'Reviewed package bytes verified and staged offline\n'
+    exit 0
+fi
+if [[ $action == guest && -s $work/guest-packages.sha256 && -s $work/Packages ]]; then
+    (cd "$apt/archives"; sha256sum -c "$work/guest-packages.sha256")
+    printf 'Existing offline guest packages verified\n'
+    exit 0
+fi
+pin=$(sed -n 's/^pin=//p' "$repo/ops/incus-host")
+version=$(sed -n 's/^version=//p' "$repo/ops/incus-host")
+[[ $pin =~ ^[A-F0-9]{40}$ && $version =~ ^[[:alnum:]:.+~-]+$ ]]
+curl --proto '=https' --max-time 60 --fail --silent --show-error https://pkgs.zabbly.com/key.asc -o "$apt/zabbly.asc.tmp"
+seen=$(gpg --batch --no-options --homedir "$apt/gpg" --with-colons --show-keys "$apt/zabbly.asc.tmp" |
+    awk -F: '$1=="pub" {primary=1; next} primary && $1=="fpr" {print $10; primary=0}')
+[[ $seen == "$pin" ]]
+mv -T -- "$apt/zabbly.asc.tmp" "$apt/zabbly.asc"
+cat > "$apt/sources.list" <<SOURCES
+deb [arch=amd64 signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://archive.ubuntu.com/ubuntu noble main universe
+deb [arch=amd64 signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://archive.ubuntu.com/ubuntu noble-updates main universe
+deb [arch=amd64 signed-by=/usr/share/keyrings/ubuntu-archive-keyring.gpg] https://security.ubuntu.com/ubuntu noble-security main universe
+deb [arch=amd64 signed-by=$apt/zabbly.asc] https://pkgs.zabbly.com/incus/lts-7.0 noble main
+SOURCES
+cat > "$apt/preferences" <<'PREFERENCES'
+Package: incus incus-base incus-client
+Pin: origin pkgs.zabbly.com
+Pin-Priority: 990
+
+Package: *
+Pin: origin pkgs.zabbly.com
+Pin-Priority: -1
+PREFERENCES
+cat > "$apt/apt.conf" <<CONFIG
+Dir::Etc::parts "/dev/null";
+Dir::Etc::main "/dev/null";
+Dir::Etc::sourcelist "$apt/sources.list";
+Dir::Etc::sourceparts "/dev/null";
+Dir::Etc::preferences "$apt/preferences";
+Dir::Etc::preferencesparts "/dev/null";
+Dir::State::lists "$apt/lists";
+Dir::Cache::archives "$apt/archives";
+Dir::Cache::pkgcache "";
+Dir::Cache::srcpkgcache "";
+APT::Architecture "amd64";
+APT::Sandbox::User "";
+Acquire::Languages "none";
+Acquire::https::Timeout "40";
+Acquire::https::AllowRedirect "false";
+Acquire::Retries "1";
+CONFIG
+export APT_CONFIG="$apt/apt.conf"
+# Do not inherit proxies for the fixture fetch.
+unset http_proxy https_proxy HTTP_PROXY HTTPS_PROXY ALL_PROXY all_proxy
+timeout 720 apt-get update --error-on=any
+case "$action" in
+    tools)
+        export_plan=$(apt-get -s --no-install-recommends install qemu-system-x86 qemu-utils ovmf genisoimage)
+        mapfile -t names < <(awk '/^Inst/ {print $2}' <<< "$export_plan")
+        if (( ${#names[@]} )); then
+            ( cd "$apt/tools"; timeout 900 apt-get download "${names[@]}" )
+        fi
+        ( cd "$apt/tools"; sha256sum -- *.deb ) > "$work/tool-packages.sha256"
+        extract_tools
+        ;;
+    guest)
+        timeout 1800 apt-get -y --download-only --no-install-recommends \
+            -o "Dir::State::status=$apt/empty.status" install \
+            btrfs-progs dosfstools gdisk grub-efi-amd64-bin rsync openssh-server nftables dnsmasq-base \
+            "incus=$version" "incus-base=$version" "incus-client=$version"
+        (cd "$apt/archives"; sha256sum -- *.deb) > "$work/guest-packages.sha256.tmp"
+        guest_index
+        mv -T -- "$work/guest-packages.sha256.tmp" "$work/guest-packages.sha256"
+        ;;
+    *) exit 2 ;;
+esac
+printf 'Fixture %s inputs staged without host package installation\n' "$action"

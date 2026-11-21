@@ -1,0 +1,40 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+set -Eeuo pipefail
+exec >/dev/ttyS0 2>&1
+check_failed() {
+    printf 'FIXTURE CHECK FAILED line %s (exit %s)\n' "$2" "$1"
+    systemctl poweroff --no-block || true
+    exit "$1"
+}
+trap 'check_failed "$?" "$LINENO"' ERR
+case "$1" in
+    manifest-ext4|manifest-btrfs)
+        [[ $(ls -1 /sys/class/net) == lo ]]
+        install -d /mnt/fixture-input
+        mount -o ro,nosuid,nodev,noexec /dev/disk/by-label/FIXTUREPKGS /mnt/fixture-input
+        if [[ $1 == manifest-ext4 ]]; then
+            [[ $(findmnt -no FSTYPE -T /) == btrfs ]]
+            python3 -I /mnt/fixture-input/manifest-guest.py ext4 worker
+        else
+            [[ $(findmnt -no FSTYPE -T /) == ext4 ]]
+            python3 -I /mnt/fixture-input/manifest-guest.py btrfs
+        fi
+        echo "FIXTURE MANIFESTS EXPORTED $1"
+        ;;
+    ext4|btrfs)
+        [[ $(findmnt -no FSTYPE -T /) == "$1" ]]
+        [[ $(ls -1 /sys/class/net) == lo ]]
+        [[ -x /opt/ci-fixture/agent-run ]]
+        echo "FIXTURE BOOT VERIFIED $1"
+        ;;
+    isolation)
+        install -d /mnt/fixture-input
+        mount -o ro,nosuid,nodev /dev/disk/by-label/FIXTUREPKGS /mnt/fixture-input
+        timeout 1200 /opt/ci-fixture/isolation-setup
+        python3 -I /mnt/fixture-input/isolation.py /run/ci-fixture/topology.json
+        echo "FIXTURE ISOLATION VERIFIED"
+        ;;
+    *) exit 2 ;;
+esac
+systemctl poweroff --no-block

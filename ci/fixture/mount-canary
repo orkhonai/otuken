@@ -1,0 +1,26 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Mount the newly created, disposable Incus block volume in worker B.
+set -Eeuo pipefail
+export LC_ALL=C
+(( EUID == 0 ))
+udevadm settle --timeout=30
+device=$(lsblk -dnpo PATH,TYPE,SERIAL | awk '$2 == "disk" && $3 == "incus_canary" {print $1; n++} END {exit n!=1}') || {
+    printf 'Expected one Incus canary block volume with serial incus_canary\n' >&2
+    exit 1
+}
+if [[ $(lsblk -npo PATH "$device") != "$device" ]]; then
+    printf 'The canary volume must have no partitions\n' >&2
+    exit 1
+fi
+probe=0
+blkid -p "$device" >/dev/null || probe=$?
+if [[ $probe != 2 ]]; then
+    printf 'Expected a blank, readable canary volume (blkid exit %s)\n' "$probe" >&2
+    exit 1
+fi
+mkfs.ext4 -q -F "$device"
+install -d -m 0700 /mnt/fixture-volume
+mount -t ext4 -o nodev,nosuid,noexec "$device" /mnt/fixture-volume
+[[ $(findmnt -rn -o SOURCE,FSTYPE --mountpoint /mnt/fixture-volume) == "$device ext4" ]]
+printf 'Mounted worker-b canary block volume (%s)\n' "$device"

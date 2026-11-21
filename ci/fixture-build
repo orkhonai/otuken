@@ -1,0 +1,256 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+set -Eeuo pipefail
+umask 077
+export LC_ALL=C PATH=/usr/sbin:/usr/bin:/sbin:/bin
+(( EUID != 0 && $# == 2 ))
+work=$1 phase=$2
+[[ $work =~ ^/[[:alnum:]_./-]+$ && -d $work && ! -L $work ]]
+[[ $(stat -c '%u:%a' "$work") == "$EUID:700" ]]
+repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+fixture="$repo/ci/fixture"
+export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
+frozen_recipe=/var/lib/otuken-ci-build/recipe
+if [[ $repo == "$frozen_recipe" ]]; then
+    [[ $(stat -c '%u:%a' "$repo" "$repo/.reviewed-commit") == $'0:755\n0:644' ]]
+    commit=$(<"$repo/.reviewed-commit")
+    [[ $commit =~ ^[a-f0-9]{40}$ ]]
+else
+    commit=$(git -C "$repo" rev-parse HEAD)
+fi
+serial=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["serial"])' "$work/ubuntu/receipt.json")
+python3 -I "$repo/ops/first_run_inputs.py" ubuntu "$work/ubuntu" "$serial" | cmp - "$work/ubuntu/receipt.json"
+image_date="${serial:0:4}-${serial:4:2}-${serial:6:2}"
+exec 9>"$work/build.lock"
+flock -n 9
+tool_root="$work/tool-root"
+qemu=(qemu-system-x86_64)
+img=(qemu-img)
+iso=(genisoimage)
+share=/usr/share
+if [[ -x $tool_root/usr/bin/qemu-system-x86_64 ]]; then
+    qemu=("$tool_root/usr/bin/qemu-system-x86_64")
+    img=("$tool_root/usr/bin/qemu-img")
+    iso=("$tool_root/usr/bin/genisoimage")
+    share="$tool_root/usr/share"
+    export LD_LIBRARY_PATH="$tool_root/usr/lib/x86_64-linux-gnu"
+    export QEMU_MODULE_DIR="$tool_root/usr/lib/x86_64-linux-gnu/qemu"
+fi
+accelerator=tcg
+cpu=max
+memory=3072
+if [[ $phase == attest ]]; then
+    [[ $repo == "$frozen_recipe" && $(id -un) == otuken-ci-build ]] ||
+        { printf 'STOP: provenance requires the dedicated builder and reviewed recipe\n' >&2; exit 1; }
+    python3 -I -c 'import os; os.close(os.open("/dev/kvm", os.O_RDWR))'
+    accelerator=kvm
+    cpu=host
+    memory=8192
+fi
+printf 'QEMU accelerator %s; 2 vCPUs, %s MiB RAM; network disabled\n' "$accelerator" "$memory"
+mkdir -p "$work"/{logs,disks,media}
+python3 -I - "$work" <<'PY'
+import shutil, sys
+disk = shutil.disk_usage(sys.argv[1])
+if disk.free < disk.total * 35 // 100 + 45 * 1024**3:
+    sys.exit("STOP: fixture build would consume the host snapshot reserve")
+PY
+scratch=$(mktemp -d "$work/.qemu.XXXXXXXX")
+trap 'rm -r -- "$scratch"' EXIT
+python3 -I "$repo/ops/first_run_inputs.py" recipe > "$scratch/recipe.sha256"
+if [[ $repo == "$frozen_recipe" ]]; then
+    reference_recipe=$(python3 -I -c 'import json,sys; print(json.load(open(sys.argv[1]))["recipe_sha256"])' \
+        "$repo/reviewed-reference.json")
+    if [[ $(sha256sum "$scratch/recipe.sha256" | cut -d' ' -f1) != "$reference_recipe" ]]; then
+        printf 'STOP: reviewed reference belongs to a different fixture recipe\n' >&2
+        exit 1
+    fi
+fi
+if [[ $phase == manifests ]]; then
+    # Existing scrubbed media can be inspected without rebuilding them.
+    test -s "$work/fixture-recipe.sha256"
+elif [[ -f $work/fixture-recipe.sha256 ]]; then
+    cmp "$scratch/recipe.sha256" "$work/fixture-recipe.sha256"
+elif [[ $phase == base && ! -e $work/disks/base.qcow2 ]]; then
+    cp -- "$scratch/recipe.sha256" "$work/fixture-recipe.sha256"
+else
+    printf 'STOP: fixture base has no recorded recipe; use a new work directory\n' >&2
+    exit 1
+fi
+
+seed() {
+    local script=$1 stage=$2
+    mkdir -p "$scratch/seed"
+    printf 'instance-id: fixture-build-%s\nlocal-hostname: fixture-build\n' "$stage" > "$scratch/seed/meta-data"
+    printf 'version: 2\nethernets: {}\n' > "$scratch/seed/network-config"
+    python3 -I - "$fixture/$script" "$stage" > "$scratch/seed/user-data" <<'PY'
+import base64, json, sys
+from pathlib import Path
+print("#cloud-config")
+print(json.dumps({
+    "users": [], "ssh_pwauth": False, "ssh_deletekeys": True, "ssh_genkeytypes": [],
+    "write_files": [{"path": "/run/fixture-step", "permissions": "0700",
+                     "encoding": "b64", "content": base64.b64encode(Path(sys.argv[1]).read_bytes()).decode()}],
+    "runcmd": [["/bin/bash", "/run/fixture-step", sys.argv[2]]],
+}))
+PY
+    "${iso[@]}" -quiet -J -r -V CIDATA -o "$scratch/seed.iso" "$scratch/seed"
+}
+
+boot() {
+    local name=$1 disk=$2 marker=$3 stage=$4 script=$5
+    shift 5
+    seed "$script" "$stage"
+    cp -- "$share/OVMF/OVMF_VARS_4M.fd" "$scratch/vars.fd"
+    local log="$work/logs/$name.serial.log"
+    local -a boot_disk=(-drive "if=virtio,format=qcow2,discard=unmap,detect-zeroes=unmap,file=$disk")
+    if [[ $stage == manifest-* ]]; then
+        boot_disk=(-drive "if=none,id=active,format=qcow2,file=$disk" -device "virtio-blk-pci,drive=active,bootindex=0")
+    fi
+    timeout -k 20 2400 nice -n 15 ionice -c 3 "${qemu[@]}" \
+        -machine "q35,accel=$accelerator" -cpu "$cpu" -smp 2 -m "$memory" \
+        -rtc "base=${image_date}T00:00:00,clock=vm" \
+        -nodefaults -no-user-config -nic none -display none -monitor none -no-reboot \
+        -sandbox on,obsolete=deny,elevateprivileges=deny,spawn=deny,resourcecontrol=deny \
+        -L "$share/qemu" \
+        -drive "if=pflash,format=raw,readonly=on,file=$share/OVMF/OVMF_CODE_4M.fd" \
+        -drive "if=pflash,format=raw,file=$scratch/vars.fd" \
+        "${boot_disk[@]}" \
+        -device virtio-scsi-pci,id=scsi \
+        -drive "if=none,id=seed,format=raw,readonly=on,file=$scratch/seed.iso" \
+        -device scsi-cd,drive=seed,bus=scsi.0 \
+        -serial "file:$log" "$@" 9>&-
+    grep -Fq "$marker" "$log"
+    printf '%s: %s (serial evidence in logs/)\n' "$name" "$marker"
+}
+media_device() {
+    args=(-drive "if=none,id=fixtures,format=raw,readonly=on,file=$scratch/media.iso"
+        -device "scsi-cd,drive=fixtures,bus=scsi.0")
+}
+metadata() {
+    local name=$1 path=$2
+    local timestamp
+    timestamp=$(date -u -d "$image_date" +%s)
+    printf 'architecture: x86_64\ncreation_date: %s\nproperties:\n  description: "otuken offline %s fixture"\n  os: Ubuntu\n  release: noble\n  requirements.secureboot: "false"\n' \
+        "$timestamp" "$name" > "$scratch/metadata.yaml"
+    tar -C "$scratch" --sort=name --mtime="@$timestamp" --numeric-owner --owner=0 --group=0 -cJf "$path" metadata.yaml
+}
+
+inspect() {
+    local boot_fs=$1 batch=$2 role disk canonical_drive
+    shift 2
+    local -a ports=(-device virtio-serial-pci)
+    "${img[@]}" create -F qcow2 -b "$work/media/$boot_fs.disk.qcow2" -f qcow2 "$scratch/inspect-$batch.qcow2"
+    if [[ $batch == ext4 ]]; then
+        canonical_drive="if=none,id=canonical,format=qcow2,readonly=on,file=$work/ubuntu/ubuntu-24.04-server-cloudimg-amd64.img"
+        ports+=(-drive "$canonical_drive" -device "scsi-hd,bus=scsi.0,drive=canonical,serial=fixture-canonical")
+    fi
+    for role in "$@"; do
+        disk="$work/media/$role.disk.qcow2"
+        if [[ $role == worker ]]; then disk="$work/disks/worker.disk.qcow2"; fi
+        ports+=(-drive "if=none,id=target-$role,format=qcow2,readonly=on,file=$disk"
+            -device "scsi-hd,bus=scsi.0,drive=target-$role,serial=fixture-$role"
+            -chardev "file,id=out-$role,path=$scratch/$role.json.gz"
+            -device "virtserialport,chardev=out-$role,name=manifest-$role")
+    done
+    boot "manifest-$batch" "$scratch/inspect-$batch.qcow2" "FIXTURE MANIFESTS EXPORTED manifest-$batch" \
+        "manifest-$batch" boot-check "${args[@]}" "${ports[@]}"
+    for role in "$@"; do gzip -t -- "$scratch/$role.json.gz"; done
+}
+
+case "$phase" in
+    manifests)
+        [[ -f $work/logs/ext4.boot.ok && -f $work/logs/btrfs.boot.ok ]]
+        for role in btrfs ext4; do
+            python3 -I "$repo/ops/first_run_inputs.py" standalone "$work/media/$role.disk.qcow2"
+        done
+        (cd "$work/media"; sha256sum -- {btrfs,ext4}.{disk.qcow2,metadata.tar.xz}) > "$scratch/images.sha256"
+        if [[ ! -f $work/disks/worker.disk.qcow2 ]]; then
+            "${img[@]}" convert -c -O qcow2 "$work/disks/base.qcow2" "$scratch/worker.disk.qcow2"
+            mv -T -- "$scratch/worker.disk.qcow2" "$work/disks/worker.disk.qcow2"
+        fi
+        python3 -I "$repo/ops/first_run_inputs.py" standalone "$work/disks/worker.disk.qcow2"
+        "${iso[@]}" -quiet -J -r -V FIXTUREPKGS -o "$scratch/media.iso" -graft-points \
+            "manifest-guest.py=$fixture/manifest-guest.py" "initramfs.py=$fixture/initramfs.py"
+        media_device
+        inspect btrfs ext4 ext4 worker
+        inspect ext4 btrfs btrfs
+        worker_hash=$(sha256sum "$work/disks/worker.disk.qcow2")
+        python3 -I - "$scratch/ext4.json.gz" "${worker_hash%% *}" <<'PY'
+import gzip, json, sys
+with gzip.open(sys.argv[1], "rt") as stream:
+    embedded = json.load(stream)["partitions"]["root"]["/opt/ci-fixture/worker.disk.qcow2"]
+if embedded["type"] != "file" or embedded["sha256"] != sys.argv[2]:
+    raise SystemExit("STOP: inventory worker differs from the worker embedded in ext4")
+PY
+        (cd "$work/media"; sha256sum -c "$scratch/images.sha256")
+        mkdir -p "$work/manifests"
+        for role in btrfs ext4 worker; do mv -T -- "$scratch/$role.json.gz" "$work/manifests/$role.json.gz"; done
+        mv -T -- "$scratch/images.sha256" "$work/manifests/images.sha256"
+        mv -T -- "$scratch/recipe.sha256" "$work/manifests/recipe.sha256"
+        printf 'Exported read-only guest inventories (ext4, btrfs and embedded worker)\n'
+        ;;
+    base)
+        if [[ -f $work/disks/base.qcow2 ]]; then
+            printf 'Base already built\n'; exit 0
+        fi
+        (cd "$work/apt/archives"; sha256sum -c "$work/guest-packages.sha256") > "$work/logs/guest-packages.log"
+        mkdir "$scratch/debs"
+        ln "$work"/apt/archives/*.deb "$scratch/debs/"
+        cp -- "$work/Packages" "$scratch/debs/"
+        "${iso[@]}" -quiet -J -r -V FIXTUREPKGS -o "$scratch/media.iso" -graft-points \
+            "debs=$scratch/debs" "agent-run=$fixture/agent-run" "incus-agent.service=$fixture/incus-agent.service" \
+            "run-fixture_agent.mount=$fixture/run-fixture_agent.mount" \
+            "incus-agent.rules=$fixture/incus-agent.rules" "mount-canary=$fixture/mount-canary" \
+            "isolation-setup=$fixture/isolation-setup" "topology.py=$fixture/topology.py"
+        media_device
+        "${img[@]}" convert -f qcow2 -O qcow2 "$work/ubuntu/ubuntu-24.04-server-cloudimg-amd64.img" "$scratch/base.qcow2"
+        "${img[@]}" resize "$scratch/base.qcow2" 12G
+        boot base "$scratch/base.qcow2" 'FIXTURE COMPLETE base' base provision "${args[@]}"
+        mv -T -- "$scratch/base.qcow2" "$work/disks/base.qcow2"
+        ;;
+    ext4|btrfs)
+        if [[ -f $work/logs/$phase.boot.ok ]]; then
+            printf '%s media already verified\n' "$phase"; exit 0
+        fi
+        test -f "$work/disks/base.qcow2"
+        "${img[@]}" create -F qcow2 -b "$work/disks/base.qcow2" -f qcow2 "$scratch/source.qcow2"
+        if [[ $phase == ext4 ]]; then
+            "${img[@]}" convert -c -O qcow2 "$work/disks/base.qcow2" "$scratch/worker.disk.qcow2"
+            metadata worker "$scratch/worker.metadata.tar.xz"
+            "${iso[@]}" -quiet -allow-limited-size -J -r -V FIXTUREPKGS -o "$scratch/media.iso" -graft-points \
+                "worker.disk.qcow2=$scratch/worker.disk.qcow2" "worker.metadata.tar.xz=$scratch/worker.metadata.tar.xz"
+            media_device
+            boot ext4-build "$scratch/source.qcow2" 'FIXTURE COMPLETE ext4' ext4 provision "${args[@]}"
+            disk="$scratch/source.qcow2"
+        else
+            "${img[@]}" create -f qcow2 "$scratch/new-root.qcow2" 12G
+            "${iso[@]}" -quiet -J -r -V FIXTUREPKGS -o "$scratch/media.iso" -graft-points "phase=$fixture/provision"
+            media_device
+            boot btrfs-build "$scratch/source.qcow2" 'FIXTURE COMPLETE btrfs' btrfs provision "${args[@]}" \
+                -drive "if=virtio,format=qcow2,discard=unmap,detect-zeroes=unmap,file=$scratch/new-root.qcow2"
+            disk="$scratch/new-root.qcow2"
+        fi
+        "${img[@]}" convert -c -O qcow2 "$disk" "$scratch/final.qcow2"
+        "${img[@]}" check -f qcow2 "$scratch/final.qcow2" > "$work/logs/$phase.qcow2.log"
+        "${img[@]}" create -F qcow2 -b "$scratch/final.qcow2" -f qcow2 "$scratch/test.qcow2"
+        boot "$phase-boot" "$scratch/test.qcow2" "FIXTURE BOOT VERIFIED $phase" "$phase" boot-check
+        metadata "$phase" "$scratch/metadata.tar.xz"
+        mv -T -- "$scratch/final.qcow2" "$work/media/$phase.disk.qcow2"
+        mv -T -- "$scratch/metadata.tar.xz" "$work/media/$phase.metadata.tar.xz"
+        if [[ $phase == ext4 ]]; then
+            mv -T -- "$scratch/worker.disk.qcow2" "$work/disks/worker.disk.qcow2"
+        fi
+        touch "$work/logs/$phase.boot.ok"
+        ;;
+    attest)
+        [[ -f $work/logs/ext4.boot.ok && -f $work/logs/btrfs.boot.ok ]]
+        python3 -I "$repo/ops/first_run_inputs.py" match "$work" "$repo/reviewed-reference.json" "$repo/agent-manifests"
+        "${iso[@]}" -quiet -J -r -V FIXTUREPKGS -o "$scratch/media.iso" -graft-points "isolation.py=$repo/ci/isolation.py"
+        media_device
+        "${img[@]}" create -F qcow2 -b "$work/media/ext4.disk.qcow2" -f qcow2 "$scratch/validate.qcow2"
+        boot isolation "$scratch/validate.qcow2" 'FIXTURE ISOLATION VERIFIED' isolation boot-check "${args[@]}"
+        python3 -I "$fixture/provenance.py" "$work" "$commit" "$repo/reviewed-reference.json"
+        ;;
+    *) exit 2 ;;
+esac

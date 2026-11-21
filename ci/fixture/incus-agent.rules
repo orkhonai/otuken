@@ -1,0 +1,2 @@
+# SPDX-License-Identifier: MIT
+SUBSYSTEM=="virtio-ports", ATTR{name}=="org.linuxcontainers.incus", TAG+="systemd", ENV{SYSTEMD_WANTS}+="incus-agent.service"

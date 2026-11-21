@@ -1,0 +1,126 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+# Build a synthetic offline topology in the disposable outer guest.
+set -Eeuo pipefail
+export LC_ALL=C INCUS_SKIP_INSTANCE_TYPES=true
+umask 077
+trap 'printf "FIXTURE SETUP FAILED in %s at line %s (exit %s)\n" "${FUNCNAME[0]:-main}" "$LINENO" "$?" >&2' ERR
+[[ $EUID == 0 && $(ls -1 /sys/class/net) == lo && -c /dev/kvm ]]
+python3 -I -c 'import os; os.close(os.open("/dev/kvm", os.O_RDWR))'
+runtime=/run/ci-fixture
+install -d "$runtime"
+inc() { timeout -k 10 180 incus --force-local "$@"; }
+guest() { inc --project "fixture-${1#worker-}" exec "$1" --mode=non-interactive -- "${@:2}"; }
+wait_agent() {
+    local attempt
+    for ((attempt=1; attempt<=90; attempt++)); do
+        if timeout -k 2 4 incus --force-local --project "fixture-${1#worker-}" exec "$1" -- /bin/true 2>/dev/null; then
+            printf 'Incus agent ready in %s\n' "$1"
+            return
+        fi
+        sleep 2
+    done
+    printf 'Timed out waiting for the Incus agent in %s\n' "$1" >&2
+    inc --project "fixture-${1#worker-}" console "$1" --show-log | tail -80 >&2 || true
+    return 1
+}
+systemctl start incus.socket
+inc info > /dev/null
+inc storage create fixture dir
+inc image import /opt/ci-fixture/worker.metadata.tar.xz /opt/ci-fixture/worker.disk.qcow2 --alias fixture-worker
+for role in a b; do
+    ip link add "fx$role" type bridge
+    ip link set "fx$role" up
+done
+ip addr add 192.0.2.1/25 dev fxa
+ip addr add 192.0.2.129/25 dev fxb
+ip -6 addr add fd5a:1::1/64 dev fxa nodad
+ip -6 addr add fd5a:2::1/64 dev fxb nodad
+ip -6 addr add fe80::1234/64 dev fxb nodad
+for address in 198.51.100.9 10.123.0.9 169.254.50.9 169.254.169.254; do ip addr add "$address/32" dev lo; done
+for address in 2001:db8:1234::9 fd5a:99::9 fd00:ec2::254; do ip -6 addr add "$address/128" dev lo; done
+nft -f - <<'NFT'
+table inet fixture {
+    chain ingress {
+        type filter hook input priority 0; policy accept;
+        iifname "fxa" ip daddr 192.0.2.1 tcp dport { 53, 8080 } accept
+        iifname "fxa" ip6 daddr fd5a:1::1 tcp dport { 53, 8080 } accept
+        iifname "fxa" ip daddr 192.0.2.1 udp dport 53 accept
+        iifname "fxa" ip6 daddr fd5a:1::1 udp dport 53 accept
+        iifname "fxa" icmpv6 type { nd-neighbor-solicit, nd-neighbor-advert } accept
+        iifname "fxa" reject with icmpx type admin-prohibited
+    }
+    chain forward {
+        type filter hook forward priority 0; policy drop;
+    }
+}
+NFT
+python3 -I /opt/ci-fixture/topology.py make "$runtime"
+canary=$(<"$runtime/canary")
+systemd-run --unit=fixture-services /usr/bin/python3 -I /opt/ci-fixture/topology.py serve "$runtime"
+systemd-run --unit=fixture-dns-a /usr/sbin/dnsmasq --keep-in-foreground --bind-interfaces \
+    --except-interface=lo --listen-address=192.0.2.1,fd5a:1::1 --no-resolv --no-hosts \
+    --local=/fixture.test/ --address=/allowed.fixture.test/192.0.2.1 --address=/allowed.fixture.test/fd5a:1::1
+systemd-run --unit=fixture-dns-b /usr/sbin/dnsmasq --keep-in-foreground --bind-interfaces \
+    --except-interface=lo --listen-address=192.0.2.129,fd5a:2::1 --no-resolv --no-hosts \
+    --local=/fixture.test/ --address=/protected.fixture.test/192.0.2.129 \
+    --address=/protected.fixture.test/fd5a:2::1 --address=/unlisted.fixture.test/192.0.2.129
+for role in a b; do
+    instance="worker-$role"
+    project="fixture-$role"
+    inc project create "$project" -c features.images=false -c features.profiles=true -c features.storage.volumes=true
+    inc --project "$project" profile device add default root disk path=/ pool=fixture size=14GiB
+    inc --project "$project" profile device add default lan nic nictype=bridged "parent=fx$role" name=fixture0
+    inc --project "$project" init fixture-worker "$instance" --vm --profile default -c limits.cpu=1 -c limits.memory=1536MiB \
+        -c security.secureboot=false -c security.nesting=false
+    inc --project "$project" config device add "$instance" fixture-agent disk source=agent:config
+    if [[ $role == b ]]; then
+        inc --project "$project" storage volume create fixture canary --type=block size=64MiB
+        inc --project "$project" config device add "$instance" canary disk pool=fixture source=canary io.bus=virtio-scsi
+        inc --project "$project" config set "$instance" "environment.FIXTURE_CANARY=$canary"
+    fi
+    inc --project "$project" start "$instance"
+    wait_agent "$instance"
+done
+
+configure() {
+    local instance=$1 v4=$2 gw4=$3 v6=$4 gw6=$5 nic
+    nic=$(guest "$instance" ls -1 /sys/class/net | awk '$0 != "lo" {print; n++} END {exit n!=1}') || {
+        printf 'Expected one synthetic NIC in %s\n' "$instance" >&2
+        return 1
+    }
+    if [[ $nic != fixture0 ]]; then
+        guest "$instance" ip link set "$nic" down
+        guest "$instance" ip link set "$nic" name fixture0
+    fi
+    guest "$instance" ip link set fixture0 up
+    guest "$instance" ip addr add "$v4/25" dev fixture0
+    guest "$instance" ip -6 addr add "$v6/64" dev fixture0 nodad
+    guest "$instance" ip route replace default via "$gw4"
+    guest "$instance" ip -6 route replace default via "$gw6"
+    guest "$instance" rm -f /etc/resolv.conf
+    printf 'nameserver %s\nnameserver %s\noptions timeout:1 attempts:1\n' "$gw4" "$gw6" |
+        guest "$instance" tee /etc/resolv.conf > /dev/null
+    printf 'Configured synthetic IPv4, IPv6 and DNS in %s\n' "$instance"
+}
+configure worker-a 192.0.2.10 192.0.2.1 fd5a:1::10 fd5a:1::1
+configure worker-b 192.0.2.130 192.0.2.129 fd5a:2::20 fd5a:2::1
+guest worker-b /opt/ci-fixture/mount-canary
+guest worker-b install -d /var/lib/ci-fixture/browser /var/cache/ci-fixture
+for path in /var/lib/ci-fixture/secret /var/lib/ci-fixture/browser/profile /var/cache/ci-fixture/provider /mnt/fixture-volume/secret; do
+    printf '%s\n' "$canary" | guest worker-b tee "$path" > /dev/null
+done
+guest worker-b systemd-run --unit=fixture-secret /usr/bin/python3 -I -m http.server 8080 \
+    --bind 192.0.2.130 --directory /var/lib/ci-fixture
+guest worker-b systemd-run --unit=fixture-guard /usr/bin/python3 -I -m http.server 8081 \
+    --bind 192.0.2.130 --directory /var/lib/ci-fixture
+guest worker-b systemd-run --unit=fixture-peer-v6 /usr/bin/python3 -I -m http.server 8082 \
+    --bind fd5a:2::20 --directory /var/lib/ci-fixture
+# shellcheck disable=SC2016
+timeout 15 bash -c '
+  until test -S "$1/owner.sock" &&
+    curl -fsS --max-time 2 http://192.0.2.1:8080/ >/dev/null &&
+    curl -fsS --max-time 2 http://192.0.2.130:8080/secret >/dev/null &&
+    curl -fsS --max-time 2 http://192.0.2.130:8081/secret >/dev/null; do sleep 1; done
+' bash "$runtime"
+printf 'Offline nested topology ready: %s/topology.json\n' "$runtime"

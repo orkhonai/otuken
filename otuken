@@ -1,0 +1,5 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+set -euo pipefail
+base=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+exec /usr/bin/python3 -I -B "$base/engine/main.py" "$@"

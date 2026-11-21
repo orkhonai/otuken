@@ -1,0 +1,31 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+set -euo pipefail
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+cd -- "$root"
+
+run_tool() {
+    local name=$1
+    shift
+    if command -v "$name" >/dev/null 2>&1; then
+        "$name" "$@"
+    elif command -v uvx >/dev/null 2>&1; then
+        if [[ $name == shellcheck ]]; then
+            uvx --from shellcheck-py shellcheck "$@"
+        else
+            uvx "$name" "$@"
+        fi
+    else
+        printf 'Missing linter: %s\n' "$name" >&2
+        exit 1
+    fi
+}
+
+run_tool ruff check engine test ci ops
+run_tool shellcheck -x \
+    otuken bin/otuken bin/otukenctl test/all test/lint \
+    ci/run ci/guest ci/fixture-apt ci/fixture-build ci/fixture-fetch \
+    ci/fixture/agent-run ci/fixture/boot-check ci/fixture/isolation-setup \
+    ci/fixture/mount-canary ci/fixture/provision \
+    ops/incus-host ops/first-run
+run_tool reuse lint

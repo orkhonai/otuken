@@ -1,0 +1,27 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+set -Eeuo pipefail
+umask 077
+export LC_ALL=C PATH=/usr/sbin:/usr/bin:/sbin:/bin
+(( EUID != 0 && $# == 2 ))
+work=$1 serial=$2
+[[ $work =~ ^/[[:alnum:]_./-]+$ && -d $work && ! -L $work && $serial =~ ^[0-9]{8}$ ]]
+[[ $(stat -c '%u:%a' "$work") == "$EUID:700" ]]
+repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+exec 9>"$work/fetch.lock"
+flock -n 9
+if [[ ! -d $work/ubuntu ]]; then
+    pending=$(mktemp -d "$work/.ubuntu.XXXXXXXX")
+    trap 'if [[ -d $pending ]]; then rm -r -- "$pending"; fi' EXIT
+    base="https://cloud-images.ubuntu.com/releases/noble/release-$serial"
+    for file in SHA256SUMS SHA256SUMS.gpg ubuntu-24.04-server-cloudimg-amd64.img; do
+        limit=$((1024**2))
+        if [[ $file == *.img ]]; then limit=$((2*1024**3)); fi
+        curl --noproxy '*' --proto '=https' --tlsv1.2 --max-time 900 --max-filesize "$limit" \
+            --fail --silent --show-error "$base/$file" -o "$pending/$file"
+    done
+    python3 -I "$repo/ops/first_run_inputs.py" ubuntu "$pending" "$serial" > "$pending/receipt.json"
+    mv -T -- "$pending" "$work/ubuntu"
+fi
+python3 -I "$repo/ops/first_run_inputs.py" ubuntu "$work/ubuntu" "$serial" | cmp - "$work/ubuntu/receipt.json"
+printf 'Canonical Noble image verified: %s/ubuntu/receipt.json\n' "$work"

@@ -1,0 +1,17 @@
+# SPDX-License-Identifier: MIT
+[Unit]
+Description=Ötüken restricted request broker
+
+[Service]
+User=otuken-guard
+ExecStart=/opt/otuken/current/otuken guard service
+NoNewPrivileges=yes
+CapabilityBoundingSet=~CAP_DAC_READ_SEARCH
+AmbientCapabilities=
+SystemCallFilter=~io_uring_setup io_uring_enter io_uring_register
+SystemCallErrorNumber=EPERM
+ProtectSystem=strict
+ReadWritePaths=/run/otuken/request
+ProtectHome=yes
+PrivateTmp=yes
+RestrictAddressFamilies=AF_UNIX

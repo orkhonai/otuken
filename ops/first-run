@@ -1,0 +1,404 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+set -Eeuo pipefail
+umask 077
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin LC_ALL=C
+export GIT_CONFIG_NOSYSTEM=1 GIT_CONFIG_GLOBAL=/dev/null
+
+(( EUID == 0 && $# >= 1 )) || { printf 'Use the owner procedure in ops/first-run.md\n' >&2; exit 2; }
+state=/root/otuken-ci-first-run
+source_dir=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)
+[[ $source_dir == "$state/reviewed/ops" ]]
+for path in / /root "$state" "$state/reviewed" "$source_dir"; do
+    [[ -d $path && ! -L $path && $(stat -c '%u:%a' "$path") =~ ^0:(700|755)$ ]]
+done
+[[ $(stat -c '%u:%a:%i' "$state") == 0:700:256 ]]
+repo=$state/reviewed.git
+keys=$state/keys
+release_key=$keys/development-release
+image_key=$keys/ci-images
+fixtures=$state/fixtures
+anchors=/etc/otuken-ci
+runner=/opt/otuken-ci/runner
+pointer=/root/otuken-incus.evidence
+incus_evidence=/var/lib/incus/otuken-ci-evidence
+fail() { printf 'STOP: %s\n' "$*" >&2; exit 1; }
+git_local() { git --git-dir="$repo" -c core.hooksPath=/dev/null "$@"; }
+safe_dir() {
+    [[ ! -L $1 ]]
+    if [[ ! -e $1 ]]; then mkdir -m "$2" -- "$1"; fi
+    [[ -d $1 && $(stat -c '%u:%a' "$1") == 0:"${2#0}" ]]
+}
+pin_file() {
+    local tmp=$1 file=$2
+    if [[ -e $file || -L $file ]]; then
+        [[ -f $file && ! -L $file && $(stat -c '%u:%a' "$file") == 0:644 ]]
+        cmp -s "$tmp" "$file" || fail "The existing signer pin differs at $file"
+    else
+        install -o root -g root -m 0644 "$tmp" "$file"
+    fi
+}
+safe_dir "$keys" 0700
+safe_dir "$fixtures" 0700
+exec 9>"$state/first-run.lock"
+flock -n 9
+# shellcheck source=ops/first-run-builder
+source "$source_dir/first-run-builder"
+
+enroll() {
+    local key=$1 principal=$2 file=$3 public
+    [[ ! -L $key && ! -L $key.pub ]]
+    if [[ ! -e $key ]]; then
+        [[ ! -e $key.pub ]]
+        ssh-keygen -q -t ed25519 -N '' -C "$principal local development only" -f "$key"
+    fi
+    [[ -f $key && $(stat -c '%u:%a' "$key") == 0:600 ]]
+    public=$(ssh-keygen -y -f "$key")
+    printf '%s %s\n' "$principal" "$public" > "$keys/$principal.allowed_signers"
+    pin_file "$keys/$principal.allowed_signers" "$file"
+    printf '%s\n' "$public" | ssh-keygen -lf /dev/stdin
+}
+
+tag_release() {
+    local label=$1 commit=$2 tag="dev-ci-$1-${2:0:12}"
+    local ref="refs/tags/$tag"
+    if ! git_local show-ref --verify --quiet "$ref"; then
+        git_local -c user.name='otuken development signer' -c user.email=otuken-dev@localhost \
+            -c gpg.format=ssh -c "user.signingkey=$release_key" tag -s "$tag" "$commit" \
+            -m "Local development CI $label"
+    fi
+    [[ $(git_local cat-file -t "$ref") == tag && $(git_local rev-parse "$ref^{commit}") == "$commit" ]]
+    git_local -c gpg.format=ssh -c "gpg.ssh.allowedSignersFile=$anchors/release.allowed_signers" \
+        verify-tag "$ref" >&2
+    printf '%s\n' "$ref"
+}
+
+sign_file() {
+    local key=$1 namespace=$2 source=$3
+    ssh-keygen -q -Y sign -f "$key" -n "$namespace" "$source"
+}
+verify_release() {
+    local dir=$1 filename=$2
+    (
+        cd -- "$dir"
+        ssh-keygen -Y verify -f "$anchors/release.allowed_signers" -I otuken-release \
+            -n otuken-release -s SHA256SUMS.sig < SHA256SUMS
+        awk -v name="$filename" '$2 == name {found++; print} END {exit found != 1}' SHA256SUMS |
+            sha256sum -c --strict
+    )
+}
+
+releases() {
+    local previous candidate expected_previous label commit ref version dir file tmp
+    expected_previous=$(<"$state/previous-commit")
+    [[ $expected_previous =~ ^[a-f0-9]{40}$ ]]
+    previous=$(git_local rev-parse refs/heads/previous)
+    candidate=$(git_local rev-parse refs/heads/reviewed)
+    [[ $previous == "$expected_previous" && $candidate == "$(<"$state/reviewed-commit")" ]]
+    for label in previous candidate; do
+        if [[ $label == candidate ]]; then commit=$candidate; else commit=$previous; fi
+        ref=$(tag_release "$label" "$commit")
+        version=$(git_local show "$ref^{commit}:version")
+        [[ $version =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?$ ]]
+        dir="$fixtures/$label"
+        file="otuken-$version.tar.gz"
+        if [[ ! -e $dir && ! -L $dir ]]; then
+            tmp=$(mktemp -d "$fixtures/.release-XXXXXXXX")
+            (
+                trap 'if [[ -d $tmp ]]; then rm -r -- "$tmp"; fi' EXIT
+                git_local archive --format=tar.gz --prefix="otuken-$version/" "$ref^{commit}" > "$tmp/$file"
+                printf '%s\n' "$version" > "$tmp/version"
+                printf '%s\n' "$commit" > "$tmp/COMMIT"
+                (cd -- "$tmp"; sha256sum "$file" > SHA256SUMS)
+                sign_file "$release_key" otuken-release "$tmp/SHA256SUMS"
+                mv -T -- "$tmp" "$dir"
+            )
+        fi
+        [[ ! -L $dir && $(<"$dir/COMMIT") == "$commit" && $(<"$dir/version") == "$version" ]]
+        verify_release "$dir" "$file"
+    done
+    [[ $(<"$fixtures/previous/version") != "$(<"$fixtures/candidate/version")" ]]
+    printf 'Verified both signed development release bundles\n'
+}
+
+channel() {
+    local dir="$fixtures/candidate" tmp expires version checksum count
+    version=$(<"$dir/version")
+    checksum=$(awk 'NR==1 {print $1}' "$dir/SHA256SUMS")
+    if [[ -f $dir/rc.json && -f $dir/rc.json.sig ]]; then
+        ssh-keygen -Y verify -f "$anchors/release.allowed_signers" -I otuken-release \
+            -n otuken-channel -s "$dir/rc.json.sig" < "$dir/rc.json"
+        count=$(python3 -I -c 'import json,sys; from datetime import datetime,UTC
+with open(sys.argv[1]) as f: row=json.load(f)
+if (row["channel"], row["version"], row["sha256"]) != ("rc", sys.argv[2], sys.argv[3]):
+    sys.exit("Signed channel differs from the candidate bundle")
+print(int((datetime.fromisoformat(row["expires"]) - datetime.now(UTC)).total_seconds()))' \
+            "$dir/rc.json" "$version" "$checksum")
+        if (( count >= 10800 )); then
+            printf 'Development channel remains valid\n'
+            return
+        fi
+    fi
+    expires=$(date -u -d '+7 days' +%FT%TZ)
+    tmp=$(mktemp -d "$dir/.channel-XXXXXXXX")
+    (
+        trap 'rm -r -- "$tmp"' EXIT
+        printf '{"channel":"rc","version":"%s","sha256":"%s","expires":"%s"}\n' \
+            "$version" "$checksum" "$expires" > "$tmp/rc.json"
+        sign_file "$release_key" otuken-channel "$tmp/rc.json"
+        mv -T -- "$tmp/rc.json" "$dir/rc.json"
+        mv -T -- "$tmp/rc.json.sig" "$dir/rc.json.sig"
+    )
+    printf 'Signed development channel through %s\n' "$expires"
+}
+
+reserve_inputs() {
+    python3 -I -c 'import shutil,sys
+usage=shutil.disk_usage(sys.argv[1])
+reserve=int(sys.argv[2]) * 1024**3
+if usage.free - reserve < usage.total * 35 // 100:
+    sys.exit("STOP: insufficient local free space for staged inputs and CI")' "$state" "$1"
+}
+
+ubuntu_image() {
+    local serial=$1 dir="$state/ubuntu" pending url file max_size
+    [[ $serial =~ ^[0-9]{8}$ ]]
+    if [[ ! -e $dir && ! -L $dir ]]; then
+        reserve_inputs 82
+        pending=$(mktemp -d "$state/.ubuntu-XXXXXXXX")
+        (
+            trap 'if [[ -d $pending ]]; then rm -r -- "$pending"; fi' EXIT
+            url="https://cloud-images.ubuntu.com/releases/noble/release-$serial"
+            for file in SHA256SUMS SHA256SUMS.gpg ubuntu-24.04-server-cloudimg-amd64.img; do
+                case "$file" in *.img) max_size=$((2*1024**3));; *) max_size=$((1024**2));; esac
+                curl --proto '=https' --proto-redir '=https' --tlsv1.2 -fLsS --max-time 900 --max-filesize "$max_size" \
+                    "$url/$file" -o "$pending/$file"
+            done
+            python3 -I "$source_dir/first_run_inputs.py" ubuntu "$pending" "$serial" > "$pending/receipt.json"
+            mv -T -- "$pending" "$dir"
+        )
+    fi
+    [[ ! -L $dir ]]
+    python3 -I "$source_dir/first_run_inputs.py" ubuntu "$dir" "$serial" | cmp - "$dir/receipt.json"
+    printf 'Canonical Noble image verified. Receipt: %s/receipt.json\n' "$dir"
+}
+
+derived() {
+    local input=$1 expected=$2 proof=$state/ubuntu/receipt.json file pending sha commit expected_uid issued
+    local reference_path=$build_recipe/reviewed-reference.json
+    local review_files=(PROVENANCE.json ext4.metadata.tar.xz ext4.disk.qcow2 btrfs.metadata.tar.xz btrfs.disk.qcow2
+        evidence/{agent,cold}.{btrfs,ext4,worker}.json.gz)
+    [[ $input == "$build_home/media" && $expected =~ ^[a-f0-9]{64}$ && -f $proof &&
+        -f $state/builder-ready && -f $state/builder-attestation ]]
+    IFS=' ' read -r expected_uid issued < "$state/builder-attestation"
+    [[ $issued == "$expected" ]]
+    commit=$(<"$state/reviewed-commit")
+    if [[ -f $state/fixture-reference.json ]]; then reference_path=$state/fixture-reference.json; fi
+    local -a verify=(python3 -I "$source_dir/first_run_inputs.py" derived)
+    local -a reference=("$proof" "$commit" "$reference_path"
+        "$(<"$state/builder-ready")" "$build_account" "$expected_uid")
+    if [[ -f $fixtures/IMAGES.sha256.sig ]]; then
+        "${verify[@]}" "$fixtures" "$expected" "${reference[@]}" |
+            cmp - "$fixtures/IMAGES.sha256"
+        ssh-keygen -Y verify -f "$anchors/image.allowed_signers" -I otuken-ci \
+            -n otuken-ci-image -s "$fixtures/IMAGES.sha256.sig" < "$fixtures/IMAGES.sha256"
+    else
+        reserve_inputs 97
+        pending=$(mktemp -d "$state/.fixtures-XXXXXXXX")
+        (
+            trap 'rm -r -- "$pending"' EXIT
+            mkdir -m 0700 "$pending/evidence"
+            for file in "${review_files[@]}"; do
+                [[ -f $input/$file && ! -L $input/$file ]]
+                # Bound the copy even if an input changes size during the transfer.
+                case "$file" in
+                    *.qcow2) sha=$((8*1024**3));;
+                    *.json.gz) sha=$((32*1024**2));;
+                    *) sha=$((1024**2));;
+                esac
+                timeout 900 runuser -u "$build_account" -- /usr/bin/head -c "$((sha+1))" -- "$input/$file" > "$pending/$file"
+                [[ $(stat -c '%s' "$pending/$file") -le $sha ]]
+            done
+            "${verify[@]}" "$pending" "$expected" "${reference[@]}" > "$pending/IMAGES.sha256"
+            sign_file "$image_key" otuken-ci-image "$pending/IMAGES.sha256"
+            safe_dir "$fixtures/evidence" 0700
+            for file in "${review_files[@]}" IMAGES.sha256 IMAGES.sha256.sig; do
+                mv -T -- "$pending/$file" "$fixtures/$file"
+            done
+        )
+    fi
+    printf '%s\n' "$expected" > "$state/fixture-approval"
+    printf 'Approved offline images verified and signed\n'
+}
+
+recover_runner_stage() {
+    [[ -f $state/runner-stage ]] || return 0
+    local stage
+    IFS= read -r stage < "$state/runner-stage"
+    [[ $stage =~ ^/opt/otuken-ci/\.runner-[[:alnum:]]{8}$ ]]
+    if [[ -e $stage || -L $stage ]]; then
+        [[ ! -L $stage && $(stat -c '%u:%a' "$stage") =~ ^0:(700|755)$ ]]
+        rm -r -- "$stage"
+    fi
+    rm -- "$state/runner-stage"
+}
+
+runner_install() {
+    local mode=$1 commit ref stage base=${runner%/runner}
+    commit=$(<"$state/reviewed-commit")
+    ref=$(tag_release candidate "$commit")
+    safe_dir "$base" 0755
+    if [[ -e $runner || -L $runner ]]; then
+        python3 -I "$source_dir/trust.py" runner "$runner"
+        if [[ $(<"$runner/.reviewed-commit") == "$commit" ]]; then
+            printf 'Reviewed runner already installed at %s\n' "$runner"; return
+        fi
+        [[ $mode == replace ]] || fail 'An installed runner differs; review the replacement first'
+    fi
+    exec 8>/run/otuken-ci.lock
+    flock -n 8 || fail 'CI runner is active'
+    exec 7>/run/otuken-incus-maintenance.lock
+    flock -n 7 || fail 'Incus maintenance is active'
+    recover_runner_stage
+    stage=$(mktemp -d "$base/.runner-XXXXXXXX")
+    printf '%s\n' "$stage" > "$state/runner-stage"
+    (
+        trap 'if [[ -d $stage ]]; then rm -r -- "$stage"; fi' EXIT
+        umask 022
+        git_local -c tar.umask=022 archive "$ref^{commit}" ci ops | tar --no-same-owner -xf - -C "$stage"
+        chmod -R u=rwX,go=rX "$stage"
+        printf '%s\n' "$commit" > "$stage/.reviewed-commit"
+        (cd -- "$stage"; find ci ops .reviewed-commit -type f -print0 | sort -z | xargs -0 sha256sum) > "$stage/.runner-sha256"
+        python3 -I "$source_dir/trust.py" runner "$stage"
+        if [[ -d $runner ]]; then
+            python3 -I "$source_dir/trust.py" replace "$stage"
+        else
+            mv -T -- "$stage" "$runner"
+        fi
+    )
+    recover_runner_stage
+    python3 -I "$source_dir/trust.py" runner "$runner"
+    printf 'Verified runner %s at %s\n' "$commit" "$runner"
+}
+
+evidence() {
+    local dir
+    [[ -f $pointer && ! -L $pointer && $(stat -c '%u:%a' "$pointer") == 0:600 ]]
+    IFS= read -r dir < "$pointer"
+    [[ $dir =~ ^/root/otuken-incus\.[A-Za-z0-9]{8}$ && ! -L $dir &&
+       $(stat -c '%u:%a' "$dir") == 0:700 ]]
+    printf '%s\n' "$dir"
+}
+
+run_ci() {
+    local lane=$1 name=$2 dir receipt
+    [[ $lane =~ ^(clean|upgrade|isolation)$ && $name =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]]
+    dir="$incus_evidence/$name"
+    if [[ -f $dir/ci.ok ]]; then
+        [[ $(<"$dir/ci.ok") == "$lane" ]]
+        printf 'CI lane already passed: %s (%s)\n' "$lane" "$dir"
+        return
+    fi
+    [[ ! -e $dir ]] || fail 'Existing run did not pass. Review the logs before choosing a new run name.'
+    receipt=$(evidence)
+    [[ -f $receipt/provisioned-ok && ! -f $receipt/rollback-ok && -f $state/fixture-approval ]]
+    channel
+    systemd-run --scope --unit=otuken-ci-run --property=RuntimeMaxSec=2h \
+        /usr/bin/env "OTUKEN_CI_LANE=$lane" "$runner/ci/run" "$fixtures" "$name" 9>&-
+    [[ -f $dir/ci.ok && $(<"$dir/ci.ok") == "$lane" ]]
+    printf 'CI evidence: %s\n' "$dir"
+}
+
+abandoned() {
+    local name=$1 run="$incus_evidence/$1" tmp token kind object instances images
+    [[ $name =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]]
+    [[ -d $run && ! -L $run && $(stat -c '%u:%a' "$run") == 0:700 ]]
+    exec 8>/run/otuken-ci.lock
+    flock -n 8 || fail 'CI runner is active'
+    tmp=$(mktemp -d "$state/.residue-XXXXXXXX")
+    (
+        trap 'rm -r -- "$tmp"' EXIT
+        inst() { timeout -k 5 90 incus --force-local --project otuken-ci "$@"; }
+        inst list --format json > "$tmp/instances"
+        inst image list --format json > "$tmp/images"
+        python3 -I "$source_dir/ci_residue.py" "$name" "$tmp/instances" "$tmp/images" "$run" > "$tmp/remove"
+        if [[ -s $tmp/remove ]]; then
+            cat "$tmp/remove"
+            read -rp 'Type discard-ci-residue to delete the recorded disposable objects: ' token </dev/tty
+            [[ $token == discard-ci-residue ]]
+            while read -r kind object; do
+                case "$kind" in
+                    vm)
+                        inst console "$object" --show-log > "$run/interrupted.console.log" 2>&1 || true
+                        inst delete "$object" --force ;;
+                    image) inst image delete "$object" ;;
+                esac
+            done < "$tmp/remove"
+        fi
+        instances=$(inst list --format csv -c n)
+        images=$(inst image list --format csv -c f)
+        [[ -z $instances && -z $images ]]
+    )
+    printf 'Dedicated CI project is empty; retained run evidence: %s\n' "$run"
+}
+
+case "$1" in
+    builder-init) [[ $# == 5 ]]; builder_init "$2" "$3" "$4" "$5" ;;
+    builder-build|builder-attest) [[ $# == 1 ]]; builder_run "${1#builder-}" ;;
+    builder-retire) [[ $# == 1 ]]; builder_retire ;;
+    keys)
+        [[ $# == 1 && -f $state/builder-attestation && ! -f $state/builder-removed ]]
+        if [[ ! -f $state/trust-intent ]]; then
+            [[ ! -e $anchors && ! -L $anchors && ! -e ${runner%/runner} && ! -L ${runner%/runner} ]] ||
+                fail "CI trust paths already exist outside this procedure"
+            touch "$state/trust-intent"
+        fi
+        safe_dir "$anchors" 0755
+        enroll "$release_key" otuken-release "$anchors/release.allowed_signers"
+        enroll "$image_key" otuken-ci "$anchors/image.allowed_signers"
+        printf 'Pinned local development and image keys\n'
+        ;;
+    releases) [[ $# == 1 ]]; releases; channel ;;
+    ubuntu) [[ $# == 2 ]]; ubuntu_image "$2" ;;
+    images) [[ $# == 3 ]]; derived "$2" "$3" ;;
+    runner) [[ -f $state/trust-intent && ( $# == 1 || ( $# == 2 && $2 == replace ) ) ]]; runner_install "${2:-install}" ;;
+    prepare)
+        [[ $# == 1 && -f $state/fixture-approval && -f $fixtures/IMAGES.sha256.sig ]]
+        if [[ -e $pointer || -L $pointer ]]; then
+            [[ -f $state/prepare-intent ]] || fail 'Another Incus maintenance procedure owns the pointer'
+        fi
+        touch "$state/prepare-intent"
+        "$runner/ops/incus-host" prepare
+        ;;
+    install|review)
+        [[ $# == 1 && -f $state/prepare-intent ]]
+        dir=$(evidence)
+        "$dir/incus-host" "$1"
+        ;;
+    health) [[ $# == 2 ]]; python3 -I "$source_dir/first_run_health.py" "$state" "$2" ;;
+    ci) [[ $# == 3 ]]; run_ci "$2" "$3" ;;
+    residue) [[ $# == 2 && -f $state/prepare-intent ]]; abandoned "$2" ;;
+    rollback)
+        [[ $# == 1 ]]
+        (
+            exec 8>/run/otuken-ci.lock
+            flock -n 8 || fail 'CI runner is active'
+            exec 7>/run/otuken-incus-maintenance.lock
+            flock -n 7 || fail 'Incus maintenance is active'
+            recover_runner_stage
+        )
+        builder_cleanup
+        if [[ -e $pointer || -L $pointer ]]; then
+            [[ -f $state/prepare-intent ]] || fail 'Another Incus maintenance procedure owns the pointer'
+            dir=$(evidence)
+            "$dir/incus-host" rollback
+            [[ -f $dir/rollback-ok ]]
+        elif [[ -f $state/trust-intent ]]; then
+            exec 8>/run/otuken-ci.lock
+            flock -n 8 || fail 'CI runner is active'
+            python3 -I "$source_dir/trust.py" cleanup
+        fi
+        printf 'Live-host rollback complete; private keys, fixtures and evidence retained under /root\n'
+        ;;
+    *) fail 'Unknown first-run stage' ;;
+esac

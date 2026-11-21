@@ -1,0 +1,6 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+set -euo pipefail
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+cd -- "$root"
+PYTHONPATH="$root/engine" PYTHONDONTWRITEBYTECODE=1 exec /usr/bin/python3 -m unittest discover -s "$root/test" -v "$@"

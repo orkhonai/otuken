@@ -1,0 +1,221 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+set -Eeuo pipefail
+umask 077
+export PATH=/usr/sbin:/usr/bin:/sbin:/bin
+if (( $# != 2 || EUID != 0 )); then
+    printf 'Usage as CI host owner: ci/run OFFLINE_FIXTURES RUN_NAME\n' >&2
+    exit 2
+fi
+
+case "${OTUKEN_CI_LANE:-all}" in all|installer|clean|upgrade|isolation) ;; *) exit 2 ;; esac
+lane=${OTUKEN_CI_LANE:-all}
+
+repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+[[ $repo == /opt/otuken-ci/runner ]]
+exec 9>/run/otuken-ci.lock
+flock -n 9
+for path in / /opt /opt/otuken-ci "$repo" "$repo/ci" "$repo/ops"; do
+    [[ -d $path && ! -L $path && $(stat -c '%u:%a' "$path") =~ ^0:(700|755)$ ]] || exit 1
+done
+[[ ! -L "$repo/ops/trust.py" && $(stat -c '%u:%a' "$repo/ops/trust.py") == 0:644 ]]
+python3 -I "$repo/ops/trust.py" runner "$repo"
+grep -Fxq '0::/system.slice/otuken-ci-run.scope' /proc/self/cgroup
+limit=$(systemctl show otuken-ci-run.scope -p RuntimeMaxUSec --value)
+[[ $limit == 2h ]]
+[[ $2 =~ ^[a-z0-9][a-z0-9-]{0,63}$ ]]
+run_name=$2
+evidence="/var/lib/incus/otuken-ci-evidence/$run_name"
+mkdir -m 0700 -- "$evidence"
+exec > >(tee "$evidence/ci.log") 2>&1
+project=otuken-ci
+vm=otuken-ci-test
+profile=otuken-ci
+guest_dir=/var/tmp/otuken-ci
+work=$(mktemp -d /var/lib/incus/.otuken-ci-stage.XXXXXXXX)
+fixtures="$work/fixtures"
+mkdir -m 0700 -- "$fixtures"
+unset INCUS_REMOTE INCUS_PROJECT
+export INCUS_CONF="$work/client"
+export INCUS_SKIP_INSTANCE_TYPES=true
+mkdir -- "$INCUS_CONF"
+inc() { timeout -k 10 420 incus --force-local --project "$project" "$@"; }
+guest() { timeout -k 10 600 incus --force-local --project "$project" exec "$vm" -- "$@"; }
+push() { inc file push "$1" "$vm$guest_dir/$2"; }
+project_empty() {
+    local instances images
+    instances=$(inc list --format csv -c n) && images=$(inc image list --format csv -c f) &&
+        [[ -z $instances && -z $images ]]
+}
+owned_vm=
+owned_image=
+cleanup() {
+    local result=$?
+    trap - EXIT
+    if [[ -n $owned_vm ]]; then
+        inc console "$vm" --show-log > "$evidence/console.log" 2>&1 || true
+        inc delete "$vm" --force || result=1
+    fi
+    if [[ -n $owned_image ]]; then
+        inc image delete "$owned_image" || result=1
+    fi
+    rm -r -- "$work" || result=1
+    if (( result == 0 )); then
+        printf '%s\n' "$lane" > "$evidence/ci.ok"
+        printf '\nCI lane passed: %s\n' "$lane"
+    fi
+    exit "$result"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# Incus is installed and provisioned separately by the owner.
+inc query "/1.0/projects/$project" > "$work/project.json"
+inc query "/1.0/profiles/$profile?project=$project" > "$work/profile.json"
+inc query "/1.0/storage-pools/otuken-ci" > "$work/pool.json"
+python3 -I "$repo/ci/preflight.py" "$work/project.json" "$work/profile.json" "$work/pool.json" /var/lib/incus
+project_empty
+
+# The owner installs the independent trust anchors outside the fixture directory.
+python3 -I "$repo/ci/stage.py" "$1" "$fixtures"
+(
+    cd -- "$fixtures"
+    ssh-keygen -Y verify -f image.allowed_signers -I otuken-ci \
+        -n otuken-ci-image -s IMAGES.sha256.sig < IMAGES.sha256
+    for file in ext4.metadata.tar.xz ext4.disk.qcow2 btrfs.metadata.tar.xz btrfs.disk.qcow2; do
+        awk -v name="$file" '$2 == name { n++; print } END { if (n != 1) exit 1 }' IMAGES.sha256 |
+            sha256sum --check --strict
+    done
+)
+candidate=$(<"$fixtures/candidate/version")
+previous=$(<"$fixtures/previous/version")
+[[ $previous != "$candidate" ]]
+
+stage() {
+    local label=$1 version=$2 directory="$fixtures/$1"
+    for file in "otuken-$version.tar.gz" SHA256SUMS SHA256SUMS.sig version; do
+        push "$directory/$file" "$label/$file"
+    done
+    if [[ $label == candidate ]]; then
+        push "$directory/rc.json" "$label/rc.json"
+        push "$directory/rc.json.sig" "$label/rc.json.sig"
+    fi
+}
+
+wait_guest() {
+    local attempt
+    for ((attempt=1; attempt<=90; attempt++)); do
+        if timeout 4 incus --force-local --project "$project" exec "$vm" -- /bin/true 2>/dev/null; then
+            return 0
+        fi
+        sleep 2
+    done
+    return 1
+}
+
+cloud_config() {
+    cat <<'YAML'
+#cloud-config
+write_files:
+  - path: /var/tmp/otuken-ci/cloud-overlay/installer.json
+    permissions: '0600'
+    content: '{"snapshot_free_percent": 20}'
+runcmd:
+  - [timeout, '240', /bin/bash, -c, 'until test -f /var/tmp/otuken-ci/ready; do sleep 1; done']
+  - [/var/tmp/otuken-ci/suite/ci/guest, cloud-install]
+YAML
+}
+
+launch() {
+    local fs=$1 method=$2 listeners qemu_pid
+    local -a config=(-c security.secureboot=false -c security.nesting=false)
+    if [[ $method == cloud ]]; then
+        config+=(-c "cloud-init.user-data=$(cloud_config)")
+    fi
+    if [[ $method == isolation ]]; then
+        config=(-c security.secureboot=false -c security.nesting=true)
+    fi
+    printf '\n%s %s\n' "$fs" "$method"
+    listeners=$(ss -H -l --vsock)
+    [[ -z $listeners ]] || {
+        printf 'Host vsock listeners exist; CI guest CIDs have no approved host policy\n' >&2
+        return 1
+    }
+    owned_vm=1
+    inc init "$owned_image" "$vm" --vm --profile "$profile" -c "user.otuken-ci-run=$run_name" "${config[@]}"
+    inc config device add "$vm" fixture-agent disk source=agent:config
+    inc config device add "$vm" fixture-cloud-init disk source=cloud-init:config
+    inc start "$vm"
+    wait_guest
+    qemu_pid=$(inc query "/1.0/instances/$vm/state?project=$project" |
+        python3 -I -c 'import json,sys; row=json.load(sys.stdin); print(row.get("metadata",row)["pid"])')
+    [[ $qemu_pid =~ ^[1-9][0-9]*$ ]]
+    cat "/proc/$qemu_pid/cgroup" > "$evidence/qemu.cgroup"
+    grep -Eq '^0::/system.slice/incus[.]service(/.*)?$' "$evidence/qemu.cgroup"
+    awk '{print $1}' /proc/modules >> "$evidence/modules"
+    [[ $(guest findmnt -n -o FSTYPE -T /) == "$fs" ]]
+    guest python3 -I -c 'from pathlib import Path; assert list(Path("/sys/class/net").iterdir()) == [Path("/sys/class/net/lo")]'
+    guest install -d "$guest_dir/candidate" "$guest_dir/previous" "$guest_dir/suite"
+    push "$fixtures/release.allowed_signers" allowed_signers
+    stage candidate "$candidate"
+    stage previous "$previous"
+    guest install -d "$guest_dir/suite/ci"
+    push "$repo/ci/guest" suite/ci/guest
+    push "$repo/ci/isolation.py" suite/ci/isolation.py
+    guest chmod 0755 "$guest_dir/suite/ci/guest"
+    guest touch "$guest_dir/ready"
+    guest cloud-init status --wait
+}
+
+reboot_test_vm() {
+    local before after
+    before=$(guest cat /proc/sys/kernel/random/boot_id)
+    inc restart "$vm" --timeout 60
+    wait_guest
+    after=$(guest cat /proc/sys/kernel/random/boot_id)
+    [[ $before != "$after" ]]
+}
+
+destroy_vm() {
+    inc console "$vm" --show-log > "$evidence/$1.console.log" 2>&1 || true
+    inc delete "$vm" --force
+    owned_vm=
+}
+
+for fs in ext4 btrfs; do
+    if [[ $lane == isolation && $fs == btrfs ]]; then
+        continue
+    fi
+    python3 -I "$repo/ci/preflight.py" "$work/project.json" "$work/profile.json" "$work/pool.json" /var/lib/incus
+    owned_image="otuken-ci-$fs"
+    # Incus split-image fingerprints hash the metadata tar followed by the disk byte stream.
+    hash=$(cat "$fixtures/$fs.metadata.tar.xz" "$fixtures/$fs.disk.qcow2" | sha256sum)
+    printf '%s %s\n' "$owned_image" "${hash%% *}" >> "$evidence/owned-images"
+    inc image import "$fixtures/$fs.metadata.tar.xz" "$fixtures/$fs.disk.qcow2" --alias "$owned_image"
+    if [[ $lane == all || $lane == installer || $lane == clean ]]; then
+        for method in manual cloud; do
+            launch "$fs" "$method"
+            guest "$guest_dir/suite/ci/guest" "$method" "$candidate"
+            reboot_test_vm
+            guest "$guest_dir/suite/ci/guest" check "$candidate"
+            destroy_vm "$fs-$method"
+        done
+    fi
+    if [[ $lane == all || $lane == installer || $lane == upgrade ]]; then
+        launch "$fs" upgrade
+        guest "$guest_dir/suite/ci/guest" upgrade "$previous" "$candidate"
+        reboot_test_vm
+        guest "$guest_dir/suite/ci/guest" rollback "$previous" "$candidate"
+        destroy_vm "$fs-upgrade"
+    fi
+    if [[ $fs == ext4 && ( $lane == all || $lane == isolation ) ]]; then
+        launch "$fs" isolation
+        guest "$guest_dir/suite/ci/guest" isolation
+        destroy_vm "$fs-isolation"
+    fi
+    inc image delete "$owned_image"
+    owned_image=
+done
+cat /sys/fs/cgroup/system.slice/incus.service/io.stat > "$evidence/io.stat"
+project_empty

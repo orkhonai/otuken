@@ -1,0 +1,14 @@
+# SPDX-License-Identifier: MIT
+[Unit]
+Description=Incus agent for offline CI images
+ConditionPathExists=/dev/virtio-ports/org.linuxcontainers.incus
+Requires=run-fixture_agent.mount
+After=local-fs.target run-fixture_agent.mount
+Before=cloud-final.service
+
+[Service]
+Type=notify
+WorkingDirectory=/run/fixture_agent
+ExecStart=/opt/ci-fixture/agent-run
+Restart=on-failure
+RestartSec=3

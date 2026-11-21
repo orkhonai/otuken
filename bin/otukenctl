@@ -1,0 +1,61 @@
+#!/bin/bash
+# SPDX-License-Identifier: MIT
+set -euo pipefail
+base=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+
+usage() {
+    cat <<'EOF'
+Usage: otukenctl [--root PATH] <command> [args...]
+
+Milestone 1 (pre-alpha) control CLI for Ötüken.
+
+Commands:
+  status        Show installed release and recovery status
+  guard ...     Forward to the local guard subcommand
+  owner         Send one JSON owner command on stdin to the guard
+  request       Send one JSON typed request on stdin to the guard
+EOF
+}
+
+root_args=()
+while (( $# > 0 )); do
+    case "$1" in
+        --root)
+            (( $# >= 2 )) || { printf 'otukenctl: --root requires a path\n' >&2; exit 2; }
+            root_args+=(--root "$2")
+            shift 2
+            ;;
+        --root=*)
+            root_args+=("$1")
+            shift
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            break
+            ;;
+    esac
+done
+
+(( $# > 0 )) || { usage >&2; exit 2; }
+
+cmd=$1
+shift
+case "$cmd" in
+    status)
+        exec "$base/otuken" "${root_args[@]}" status "$@"
+        ;;
+    guard)
+        exec "$base/otuken" "${root_args[@]}" guard "$@"
+        ;;
+    owner|request)
+        exec "$base/otuken" "${root_args[@]}" guard "$cmd" "$@"
+        ;;
+    *)
+        printf 'otukenctl: unknown command: %s\n' "$cmd" >&2
+        usage >&2
+        exit 2
+        ;;
+esac
